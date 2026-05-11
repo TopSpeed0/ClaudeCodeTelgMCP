@@ -168,13 +168,31 @@ function runClaude(task) {
   });
 }
 
+// ---------- Typing indicator ----------
+// Telegram's "typing..." badge lasts ~5 seconds. We re-send every 4s while Claude works.
+function startTyping() {
+  const send = () => {
+    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' })
+      .catch(e => log(`typing indicator: ${e.message}`));
+  };
+  send(); // fire immediately
+  const interval = setInterval(send, 4000);
+  return () => clearInterval(interval);
+}
+
 // Sentinel the agent prints to stdout when it has already delivered the answer via tg_send.
 // Daemon then suppresses the stdout relay entirely.
 const TG_SENT_SENTINEL = /\[sent-via-tg\]/i;
 
 async function handleMessage(text) {
+  const stopTyping = startTyping();
   const t0 = Date.now();
-  const { ok, text: result, code } = await runClaude(text);
+  let result, ok, code;
+  try {
+    ({ ok, text: result, code } = await runClaude(text));
+  } finally {
+    stopTyping();
+  }
   const dt = ((Date.now() - t0) / 1000).toFixed(1);
   const trimmed = stripAnsi(result || '').trim();
 
