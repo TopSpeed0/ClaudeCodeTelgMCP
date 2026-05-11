@@ -104,6 +104,8 @@ stdout = Here is your answer with **bold** text...
 (daemon wraps this in <pre> → user sees literal asterisks in a code block)
 ```
 
+**Safety net (since 2026-05):** If you forget `tg_send`, the daemon now converts Markdown stdout to Telegram HTML before sending (bold, italic, code, bullets, headers, fenced blocks). It also auto-detects aligned CLI output and wraps it in `<pre>` to preserve column alignment. **This is a fallback, not a replacement** — you still get more control (custom layouts, links, escape correctness) by calling `tg_send` directly. The IRON RULE stands.
+
 ### When to use `tg_ask`
 - Need user approval before a destructive action → `tg_ask`
 - Need clarification or a choice → `tg_ask`
