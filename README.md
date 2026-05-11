@@ -16,22 +16,48 @@ A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-
 | `.claude/settings.local.json` | Pre-configured permissions for PowerShell, Node, Telegram tools |
 | `.gitignore` | Excludes credentials and runtime state |
 
-## Quick Start
+## Installation
 
+### Prerequisites
+
+Install all three in any order — one line each:
+
+| Tool | Windows | macOS / Linux |
+|------|---------|---------------|
+| **Node.js 22+** | `winget install OpenJS.NodeJS.LTS` | `curl -fsSL https://fnm.vercel.app/install \| bash && fnm install --lts` |
+| **PowerShell 7+** | `winget install Microsoft.PowerShell` | `brew install powershell` / [install docs](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-linux) |
+| **Claude Code** | `npm install -g @anthropic-ai/claude-code` | `npm install -g @anthropic-ai/claude-code` |
+
+> After installing Claude Code, run `claude` once to authenticate with your Anthropic account.
+
+### One-Prompt Install
+
+Copy-paste this single block — it clones the repo, creates your config, and opens Claude Code:
+
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; Copy-Item .mcp.json.example .mcp.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
+```
+
+**macOS / Linux (bash):**
 ```bash
-# 1. Clone this repo
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git
-cd ClaudeCodeTelgMCP
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git && cd ClaudeCodeTelgMCP && cp .mcp.json.example .mcp.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
+```
 
-# 2. Set up credentials
-cp .mcp.json.example .mcp.json
-# Edit .mcp.json — add your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
-
-# 3. Open in Claude Code
+After editing `.mcp.json` with your credentials:
+```bash
 claude
+```
 
-# 4. (Optional) Start the task daemon for remote access
-.\mcp\start-task-daemon.ps1
+That's it. Claude Code reads `.mcp.json`, auto-launches the Telegram MCP server, and you have `tg_send` + `tg_ask` tools ready.
+
+### (Optional) Start the Task Daemon
+
+To receive Telegram messages as Claude tasks while you're away:
+
+```powershell
+.\mcp\start-task-daemon.ps1              # foreground — see logs live
+.\mcp\start-task-daemon.ps1 -Background  # detached — logs to mcp/task-daemon.log
 ```
 
 ## Getting Your Telegram Credentials
