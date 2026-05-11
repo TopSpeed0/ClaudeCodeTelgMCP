@@ -1,0 +1,17 @@
+# Credentials — NEVER commit these
+.telegram-config
+.mcp.json
+
+# Runtime state files
+.telegram-state.json
+.telegram-task-state.json
+
+# Daemon logs
+mcp/task-daemon.log
+mcp/task-daemon.log.err
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/

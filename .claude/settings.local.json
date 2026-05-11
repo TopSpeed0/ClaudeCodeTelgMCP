@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pwsh -Command:*)",
+      "PowerShell",
+      "Bash(node:*)",
+      "mcp__telegram-tg__tg_send",
+      "mcp__telegram-tg__tg_ask"
+    ]
+  },
+  "enableAllProjectMcpServers": true
+}
