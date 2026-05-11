@@ -73,70 +73,44 @@ This requires Node.js 22+. PowerShell/curl already use the OS cert store and are
 
 ---
 
-## Behavioral Rules for Claude (READ CAREFULLY)
+## Telegram Behavioral Rules (CRITICAL — READ EVERY SESSION)
 
-The rules below ensure a seamless Telegram experience. They are critical — without them, users get duplicate messages, broken formatting, and a poor experience.
-
-### Rule 1: Telegram Message Formatting
-
-- **Default: plain text.** Do NOT use Markdown syntax (`**bold**`, `` `code` ``, `[link](url)`) in `tg_send` or `tg_ask` messages — Telegram renders them as literal characters (asterisks, backticks, brackets).
-- **For rich formatting**: pass `parse_mode: "HTML"` and use HTML tags:
-  - `<b>bold</b>`, `<i>italic</i>`, `<code>inline code</code>`
-  - `<pre>code block</pre>`, `<a href="url">link text</a>`
-  - Escape `<`, `>`, `&` in dynamic content as `&lt;`, `&gt;`, `&amp;`
-- **Never mix** Markdown syntax with HTML parse_mode — pick one.
-- When in doubt, use plain text. It always works.
-
-### Rule 2: No Double-Send via Task Daemon
-
-When the task daemon (`telegram-task-daemon.js`) spawns you via `claude -p`, it captures your stdout and relays it to Telegram as a `<pre>`-wrapped monospace message. If you ALSO used `tg_send` to deliver a rich answer, the user sees the same content **twice**.
+### IRON RULE: When running under the task daemon (`claude -p`), ALWAYS use `tg_send` to deliver your answer.
 
 **Detection — am I running under the daemon?**
-- Your prompt is a single task description (typical `claude -p` invocation), not an interactive conversation
-- You have access to MCP tools `tg_send` and `tg_ask` (via `telegram-tg`)
-- There is no transcript history of prior turns — it's a fresh `-p` invocation
+- Single task prompt (no conversation history) = daemon-spawned
+- You have access to MCP tool `tg_send` via `telegram-tg`
 
-**The rule — pick ONE delivery method per response:**
+**The rule — EVERY response goes through `tg_send`. No exceptions.**
+- Use `tg_send` with `parse_mode: "HTML"` for ALL responses — short or long, simple or complex
+- After calling `tg_send`, your stdout MUST be only: `[sent-via-tg]`
+- NEVER output a substantive answer to stdout — the daemon wraps it in ugly `<pre>` monospace
 
-| If you used `tg_send` to deliver the answer | If you did NOT use `tg_send` |
-|---|---|
-| Your final stdout MUST end with the literal sentinel `[sent-via-tg]` on its own line, and contain nothing else of substance | Your stdout IS the answer — write it as a clean, monospace-friendly block. The daemon wraps it in `<pre>` |
+**Formatting:**
+- ALWAYS pass `parse_mode: "HTML"` to `tg_send`
+- Use HTML tags: `<b>bold</b>`, `<i>italic</i>`, `<code>mono</code>`, `<pre>block</pre>`, `<a href="url">link</a>`
+- Escape `<`, `>`, `&` in dynamic content as `&lt;`, `&gt;`, `&amp;`
+- NEVER use Markdown syntax (`**bold**`, `` `code` ``) — Telegram renders them as literal characters
 
-**The sentinel `[sent-via-tg]`** is matched case-insensitively by the daemon. When detected, the daemon suppresses the entire stdout relay.
-
-**Correct examples:**
+**Correct:**
 ```
-# Used tg_send for rich content — stdout is just the sentinel:
-[sent-via-tg]
-
-# Did NOT use tg_send — stdout is the full answer:
-Top results:
-  item_a: 447
-  item_b: 233
+Call tg_send with parse_mode:"HTML" → rich formatted message delivered
+stdout = [sent-via-tg]
 ```
 
-**Anti-pattern (causes double-message):**
+**WRONG (causes ugly monospace):**
 ```
-# DON'T do this — both tg_send AND a verbose stdout:
-Sent message_id=119 with rich formatting.
-The user should now see the report in Telegram.
+stdout = Here is your answer with **bold** text...
+(daemon wraps this in <pre> → user sees literal asterisks in a code block)
 ```
 
-**Edge cases:**
-- If `tg_send` was used, keep stdout minimal. The sentinel must be present for suppression.
-- Errors: don't suppress error info with the sentinel — let the daemon surface errors naturally.
-- `tg_ask` counts as "used tg_send" — you already had a Telegram interaction. Sentinel applies.
+### When to use `tg_ask`
+- Need user approval before a destructive action → `tg_ask`
+- Need clarification or a choice → `tg_ask`
+- After `tg_ask`, the sentinel `[sent-via-tg]` still applies
 
-### Rule 3: When to Use Which Tool
+### When running interactively (not daemon), respond normally in chat. These rules only apply to daemon-spawned sessions.
 
-| Situation | Tool | Why |
-|-----------|------|-----|
-| Long task finished, user needs to know | `tg_send` | Fire-and-forget notification |
-| Need user approval before destructive action | `tg_ask` | Blocks until user replies yes/no |
-| Error or unexpected state, need guidance | `tg_ask` | Get human input before proceeding |
-| Quick status check the user requested | stdout (no `tg_send`) | Daemon relays it as monospace — perfect for tables/data |
-| Rich formatted report with links/bold | `tg_send` with `parse_mode: "HTML"` | Then print `[sent-via-tg]` to stdout |
+### Safety
 
-### Rule 4: Safety
-
-Always confirm destructive operations before executing. Use `tg_ask` to get remote approval when the user isn't at their desk. Never run dangerous commands without explicit user confirmation.
+Always confirm destructive operations before executing. Use `tg_ask` to get remote approval when the user isn't at their desk.
