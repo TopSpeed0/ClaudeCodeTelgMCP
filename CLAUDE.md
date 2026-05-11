@@ -16,9 +16,10 @@ Always-on bridge that long-polls Telegram for messages and spawns `claude -p <ta
 
 Features:
 - Automatic session continuation (`--continue`) across messages
-- Sentinel-based dedup: if the agent already sent the answer via `tg_send`, it prints `[sent-via-tg]` to stdout and the daemon suppresses the redundant relay
+- Sentinel-based dedup (see rules below)
 - Smart chunking for long outputs (respects Telegram's 4096-char limit)
 - ANSI-strip for clean monospace output
+- Cross-platform: auto-detects Windows vs macOS/Linux for process spawning
 
 ### Launcher — `mcp/start-task-daemon.ps1`
 PowerShell 7+ script to start the daemon in foreground or background mode. Auto-kills any previous daemon instance on restart.
@@ -68,6 +69,72 @@ If your organization intercepts TLS (MITM proxy), Node.js will fail HTTPS calls 
 
 This requires Node.js 22+. PowerShell/curl already use the OS cert store and are unaffected.
 
-## Safety
+---
 
-Always confirm destructive operations before executing. Use `tg_ask` to get remote approval when the user isn't at their desk.
+## Behavioral Rules for Claude (READ CAREFULLY)
+
+The rules below ensure a seamless Telegram experience. They are critical — without them, users get duplicate messages, broken formatting, and a poor experience.
+
+### Rule 1: Telegram Message Formatting
+
+- **Default: plain text.** Do NOT use Markdown syntax (`**bold**`, `` `code` ``, `[link](url)`) in `tg_send` or `tg_ask` messages — Telegram renders them as literal characters (asterisks, backticks, brackets).
+- **For rich formatting**: pass `parse_mode: "HTML"` and use HTML tags:
+  - `<b>bold</b>`, `<i>italic</i>`, `<code>inline code</code>`
+  - `<pre>code block</pre>`, `<a href="url">link text</a>`
+  - Escape `<`, `>`, `&` in dynamic content as `&lt;`, `&gt;`, `&amp;`
+- **Never mix** Markdown syntax with HTML parse_mode — pick one.
+- When in doubt, use plain text. It always works.
+
+### Rule 2: No Double-Send via Task Daemon
+
+When the task daemon (`telegram-task-daemon.js`) spawns you via `claude -p`, it captures your stdout and relays it to Telegram as a `<pre>`-wrapped monospace message. If you ALSO used `tg_send` to deliver a rich answer, the user sees the same content **twice**.
+
+**Detection — am I running under the daemon?**
+- Your prompt is a single task description (typical `claude -p` invocation), not an interactive conversation
+- You have access to MCP tools `tg_send` and `tg_ask` (via `telegram-tg`)
+- There is no transcript history of prior turns — it's a fresh `-p` invocation
+
+**The rule — pick ONE delivery method per response:**
+
+| If you used `tg_send` to deliver the answer | If you did NOT use `tg_send` |
+|---|---|
+| Your final stdout MUST end with the literal sentinel `[sent-via-tg]` on its own line, and contain nothing else of substance | Your stdout IS the answer — write it as a clean, monospace-friendly block. The daemon wraps it in `<pre>` |
+
+**The sentinel `[sent-via-tg]`** is matched case-insensitively by the daemon. When detected, the daemon suppresses the entire stdout relay.
+
+**Correct examples:**
+```
+# Used tg_send for rich content — stdout is just the sentinel:
+[sent-via-tg]
+
+# Did NOT use tg_send — stdout is the full answer:
+Top results:
+  item_a: 447
+  item_b: 233
+```
+
+**Anti-pattern (causes double-message):**
+```
+# DON'T do this — both tg_send AND a verbose stdout:
+Sent message_id=119 with rich formatting.
+The user should now see the report in Telegram.
+```
+
+**Edge cases:**
+- If `tg_send` was used, keep stdout minimal. The sentinel must be present for suppression.
+- Errors: don't suppress error info with the sentinel — let the daemon surface errors naturally.
+- `tg_ask` counts as "used tg_send" — you already had a Telegram interaction. Sentinel applies.
+
+### Rule 3: When to Use Which Tool
+
+| Situation | Tool | Why |
+|-----------|------|-----|
+| Long task finished, user needs to know | `tg_send` | Fire-and-forget notification |
+| Need user approval before destructive action | `tg_ask` | Blocks until user replies yes/no |
+| Error or unexpected state, need guidance | `tg_ask` | Get human input before proceeding |
+| Quick status check the user requested | stdout (no `tg_send`) | Daemon relays it as monospace — perfect for tables/data |
+| Rich formatted report with links/bold | `tg_send` with `parse_mode: "HTML"` | Then print `[sent-via-tg]` to stdout |
+
+### Rule 4: Safety
+
+Always confirm destructive operations before executing. Use `tg_ask` to get remote approval when the user isn't at their desk. Never run dangerous commands without explicit user confirmation.

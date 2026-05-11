@@ -20,8 +20,8 @@ A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/YOUR_USERNAME/claude-telegram-workspace.git
-cd claude-telegram-workspace
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git
+cd ClaudeCodeTelgMCP
 
 # 2. Set up credentials
 cp .mcp.json.example .mcp.json
