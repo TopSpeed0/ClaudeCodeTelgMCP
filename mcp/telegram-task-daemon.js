@@ -84,26 +84,116 @@ function htmlEscape(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-async function sendChunked(text, { mono = true } = {}) {
+// Convert common Markdown-ish stdout to Telegram-flavoured HTML so that
+// when the agent forgets to use tg_send, its plain stdout still renders as
+// rich formatting instead of an ugly <pre> monospace block.
+//
+// Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists.
+// Out of scope: tables, links, images, blockquotes.
+function markdownToTelegramHTML(text) {
+  // Stash fenced code blocks first so their contents are immune to subsequent
+  // bold/italic/header rewrites. We replace them back at the very end.
+  const codeBlocks = [];
+  let html = text.replace(/```[\w-]*\n?([\s\S]*?)```/g, (_m, body) => {
+    codeBlocks.push(body.replace(/\n+$/, ''));
+    return `\u0000CB${codeBlocks.length - 1}\u0000`;
+  });
+
+  // Same trick for inline code spans.
+  const inlineCodes = [];
+  html = html.replace(/`([^`\n]+?)`/g, (_m, body) => {
+    inlineCodes.push(body);
+    return `\u0000IC${inlineCodes.length - 1}\u0000`;
+  });
+
+  // Escape HTML entities in the remaining (non-code) text.
+  html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Bold: **x** or __x__
+  html = html.replace(/\*\*([^\n*]+?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/__([^\n_]+?)__/g, '<b>$1</b>');
+
+  // Italic: *x* / _x_ (avoid touching word-internal underscores/asterisks).
+  html = html.replace(/(^|[^\w*])\*([^\n*]+?)\*(?!\w)/g, '$1<i>$2</i>');
+  html = html.replace(/(^|[^\w_])_([^\n_]+?)_(?!\w)/g, '$1<i>$2</i>');
+
+  // Headers (#, ##, ###) — Telegram HTML has no <h*>, render bold.
+  html = html.replace(/^#{1,6} +(.+)$/gm, '<b>$1</b>');
+
+  // Bullet lists: `- item` / `* item` -> `• item`.
+  html = html.replace(/^[ \t]*[-*] +(.+)$/gm, '• $1');
+
+  // Numbered lists: keep `1. item` as plain text (already readable).
+  // No transformation needed; HTML escape was already applied.
+
+  // Restore inline code as <code>...</code> (escape inner HTML).
+  html = html.replace(/\u0000IC(\d+)\u0000/g, (_m, i) => {
+    const body = inlineCodes[Number(i)];
+    return `<code>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code>`;
+  });
+
+  // Restore fenced code blocks as <pre>...</pre>.
+  html = html.replace(/\u0000CB(\d+)\u0000/g, (_m, i) => {
+    const body = codeBlocks[Number(i)];
+    return `<pre>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`;
+  });
+
+  return html.trim();
+}
+
+// Heuristic: text that looks like aligned CLI tables (multiple lines with
+// 2+ runs of 2+ consecutive spaces — i.e. column gutters) is better preserved
+// verbatim in <pre> than rewritten as rich HTML.
+function looksTabular(text) {
+  const lines = text.split('\n');
+  let hits = 0;
+  for (const line of lines) {
+    const gutters = line.match(/ {2,}/g);
+    if (gutters && gutters.length >= 2) hits++;
+    if (hits >= 3) return true;
+  }
+  return false;
+}
+
+async function sendChunked(text, { mode = 'rich' } = {}) {
   // Telegram caps messages at 4096 chars. We leave headroom for the <pre>...</pre> wrapper.
   const MAX = 3800;
   let remaining = stripAnsi(text || '(no output)');
+
+  // In 'rich' mode, fall back to monospace if the payload looks like a table —
+  // alignment matters more than formatting for CLI output.
+  let effectiveMode = mode;
+  if (mode === 'rich' && looksTabular(remaining)) effectiveMode = 'mono';
+
   while (remaining.length > 0) {
     let chunk = remaining.slice(0, MAX);
     if (remaining.length > MAX) {
       const lastBreak = Math.max(chunk.lastIndexOf('\n'), chunk.lastIndexOf(' '));
       if (lastBreak > MAX * 0.5) chunk = chunk.slice(0, lastBreak);
     }
-    const body = mono ? `<pre>${htmlEscape(chunk)}</pre>` : chunk;
+
+    let body, parse_mode;
+    if (effectiveMode === 'mono') {
+      body = `<pre>${htmlEscape(chunk)}</pre>`;
+      parse_mode = 'HTML';
+    } else if (effectiveMode === 'rich') {
+      body = markdownToTelegramHTML(chunk);
+      parse_mode = 'HTML';
+    } else {
+      body = chunk;
+      parse_mode = undefined;
+    }
+
     try {
       await tgApi('sendMessage', {
         chat_id: config.chat_id,
         text: body,
-        parse_mode: mono ? 'HTML' : undefined,
+        parse_mode,
         disable_web_page_preview: true,
       });
     } catch (e) {
-      // Fallback to plain text if Telegram rejected the HTML for any reason.
+      // Fallback to plain text if Telegram rejected the HTML for any reason
+      // (unbalanced tags from a half-baked Markdown conversion, etc.).
       log(`sendMessage HTML failed (${e.message}) — retrying plain`);
       await tgApi('sendMessage', {
         chat_id: config.chat_id,
@@ -197,8 +287,10 @@ async function handleMessage(text) {
   const trimmed = stripAnsi(result || '').trim();
 
   if (!ok) {
-    // Errors always surface — user needs to know.
-    await sendChunked(`Failed (exit=${code}, ${dt}s):\n${trimmed || '(no output)'}`, { mono: true });
+    // Errors always surface — user needs to know. Use rich mode so prose-style
+    // failures (e.g. "You've hit your limit") render cleanly; looksTabular()
+    // will auto-fall back to <pre> for stderr that looks like aligned output.
+    await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${trimmed || '(no output)'}`, { mode: 'rich' });
     return;
   }
 
@@ -214,8 +306,10 @@ async function handleMessage(text) {
     return;
   }
 
-  // Otherwise the agent's stdout IS the answer — relay it as a monospace block.
-  await sendChunked(trimmed, { mono: true });
+  // Otherwise the agent's stdout IS the answer — relay it as rich HTML (Markdown -> Telegram HTML).
+  // Safety net for when the agent forgot to call tg_send. The looksTabular() heuristic inside
+  // sendChunked will fall back to <pre> if the payload looks like aligned CLI table output.
+  await sendChunked(trimmed, { mode: 'rich' });
 }
 
 let busy = false;
@@ -249,7 +343,7 @@ async function pollLoop() {
       }
       busy = true;
       try { await handleMessage(m.text); }
-      catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`); } catch (_) {} }
+      catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`, { mode: 'plain' }); } catch (_) {} }
       busy = false;
     }
   }
