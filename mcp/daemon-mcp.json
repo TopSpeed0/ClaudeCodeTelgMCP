@@ -1,3 +1,14 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "telegram-tg": {
+      "command": "node",
+      "args": [
+        "mcp/telegram-tg.js"
+      ],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "YOUR_BOT_TOKEN_HERE",
+        "TELEGRAM_CHAT_ID": "YOUR_CHAT_ID_HERE"
+      }
+    }
+  }
 }
