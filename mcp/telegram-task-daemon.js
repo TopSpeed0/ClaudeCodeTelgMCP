@@ -217,9 +217,12 @@ function quoteForCmd(arg) {
   return `"${escaped}"`;
 }
 
+const CLAUDE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max per task
+
 function runClaude(task) {
   return new Promise((resolve) => {
-    const args = ['-p', task, '--dangerously-skip-permissions',
+    const args = ['-p', task, '--model', 'claude-opus-4-6',
+                  '--dangerously-skip-permissions',
                   '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
     if (state.sessionStarted) args.push('--continue');
 
@@ -245,10 +248,26 @@ function runClaude(task) {
     }
 
     let out = '', errOut = '';
+    let killed = false;
     proc.stdout.on('data', (d) => out += d.toString());
     proc.stderr.on('data', (d) => errOut += d.toString());
     proc.on('error', (e) => resolve({ ok: false, text: `spawn error: ${e.message}` }));
+
+    // Kill runaway tasks so the daemon stays responsive.
+    const timer = setTimeout(() => {
+      killed = true;
+      log(`timeout: killing claude after ${CLAUDE_TIMEOUT_MS / 1000}s`);
+      try { proc.kill('SIGTERM'); } catch (_) {}
+      // On Windows cmd.exe doesn't always forward signals — force-kill after 5s.
+      setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000);
+    }, CLAUDE_TIMEOUT_MS);
+
     proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (killed) {
+        resolve({ ok: false, text: `Task timed out after ${CLAUDE_TIMEOUT_MS / 1000}s. Partial output:\n${out.trim() || '(none)'}`, code: -1 });
+        return;
+      }
       // Only mark the session started on success — otherwise a failed first run
       // would lock us into --continue against a session that never existed.
       if (code === 0 && !state.sessionStarted) { state.sessionStarted = true; saveState(); }
