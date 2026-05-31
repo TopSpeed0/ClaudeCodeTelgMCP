@@ -109,6 +109,30 @@ When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-
 - PowerShell 7+ (for the launcher and shortcut scripts)
 - A Telegram bot token + your chat ID
 
+## Hermes Overmind Integration
+
+This repo can be paired with **[Hermes Agent](https://hermes-agent.nousresearch.com/)** as a two-tier AI system:
+
+| Layer | Role |
+|-------|------|
+| **Hermes** (Telegram bot) | Overmind — receives user requests, handles simple tasks directly |
+| **Claude Code** (daemon) | Worker — executes heavy workspace tasks, code, CLI commands |
+
+### How it works
+Hermes writes tasks to `.claude-queue.json` in the workspace root. The daemon polls it every 5 seconds, runs `claude -p` with the task, and writes the result back. Hermes reads the result and reports to the user on Telegram.
+
+```json
+// .claude-queue.json
+{
+  "id": "hermes-001",
+  "task": "Check disk usage on the NetApp cluster",
+  "status": "pending",
+  "created": "2026-05-31T10:00:00Z"
+}
+```
+
+The daemon sets `status: "done"` and writes the result back — Hermes picks it up and delivers it to the user. No bot-to-bot Telegram messaging needed.
+
 ## License
 
 MIT
