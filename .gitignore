@@ -15,3 +15,4 @@ mcp/task-daemon.log.err
 Thumbs.db
 *.swp
 .vscode/
+.claude-queue.json

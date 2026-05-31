@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// telegram-task-daemon.js — Always-on Telegram -> Claude Code bridge.
+// telegram-task-daemon.js — Always-on Telegram → Claude Code bridge.
 //
 // Long-polls Telegram for messages from the authorized chat, spawns
 // `claude -p --continue --dangerously-skip-permissions <task>` per message,
@@ -40,10 +40,39 @@ function loadConfig() {
 
 const config = loadConfig();
 
-let state = { updateOffset: 0, sessionStarted: false };
-try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) }; } catch (_) {}
+let state = { updateOffset: 0, sessionId: null };
+try {
+  const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
+  // Migrate old sessionStarted boolean → sessionId
+  if (raw.sessionStarted !== undefined) delete raw.sessionStarted;
+  state = { ...state, ...raw };
+} catch (_) {}
 function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { log(`saveState: ${e.message}`); }
+}
+
+// ---------- Session tracking ----------
+const PROJECT_DIR = (() => {
+  // Claude stores sessions under ~/.claude/projects/<encoded-workdir>/
+  const encoded = WORKDIR.replace(/[/\\]/g, '-').replace(/^-/, '').replace(/:/g, '');
+  // Try both slash styles (Windows path encoded two ways)
+  const candidates = [
+    path.join(process.env.USERPROFILE || process.env.HOME, '.claude', 'projects', encoded),
+    path.join(process.env.USERPROFILE || process.env.HOME, '.claude', 'projects',
+      WORKDIR.replace(/\\/g, '-').replace(/^-/, '').replace(/:/g, '')),
+  ];
+  return candidates.find(p => fs.existsSync(p)) || candidates[0];
+})();
+
+function getNewestSessionId() {
+  try {
+    const files = fs.readdirSync(PROJECT_DIR)
+      .filter(f => /^[0-9a-f-]{36}\.jsonl$/.test(f))
+      .map(f => ({ f, mtime: fs.statSync(path.join(PROJECT_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (!files.length) return null;
+    return files[0].f.replace('.jsonl', '');
+  } catch { return null; }
 }
 
 function tgApi(method, params, { httpTimeoutMs } = {}) {
@@ -205,9 +234,6 @@ async function sendChunked(text, { mode = 'rich' } = {}) {
   }
 }
 
-// ---------- Platform-specific spawn helpers ----------
-const IS_WIN = process.platform === 'win32';
-
 function quoteForCmd(arg) {
   // cmd.exe-safe quoting: wrap in double quotes if it contains whitespace or quotes;
   // escape embedded quotes and trailing backslashes per Windows command-line rules.
@@ -224,29 +250,23 @@ function runClaude(task) {
     const args = ['-p', task, '--model', 'claude-opus-4-6',
                   '--dangerously-skip-permissions',
                   '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
-    if (state.sessionStarted) args.push('--continue');
-
-    let proc;
-    if (IS_WIN) {
-      // Windows: build cmd.exe command line to avoid Node re-escaping paths with spaces.
-      const cmdLine = ['claude', ...args.map(quoteForCmd)].join(' ');
-      log(`spawn: ${cmdLine}`);
-      proc = spawn(process.env.COMSPEC || 'cmd.exe',
-        ['/d', '/s', '/c', cmdLine],
-        {
-          cwd: WORKDIR,
-          windowsVerbatimArguments: true,
-          env: { ...process.env },
-        });
+    if (state.sessionId) {
+      args.push('--resume', state.sessionId);
+      log(`resuming session ${state.sessionId}`);
     } else {
-      // macOS / Linux: spawn claude directly.
-      log(`spawn: claude ${args.join(' ')}`);
-      proc = spawn('claude', args, {
+      log('starting fresh session');
+    }
+    // Build the full cmd.exe command line ourselves and pass it verbatim,
+    // so Node's spawn doesn't re-escape paths that already contain spaces.
+    const cmdLine = ['claude', ...args.map(quoteForCmd)].join(' ');
+    log(`spawn: ${cmdLine}`);
+    const proc = spawn(process.env.COMSPEC || 'cmd.exe',
+      ['/d', '/s', '/c', cmdLine],
+      {
         cwd: WORKDIR,
+        windowsVerbatimArguments: true,
         env: { ...process.env },
       });
-    }
-
     let out = '', errOut = '';
     let killed = false;
     proc.stdout.on('data', (d) => out += d.toString());
@@ -268,9 +288,19 @@ function runClaude(task) {
         resolve({ ok: false, text: `Task timed out after ${CLAUDE_TIMEOUT_MS / 1000}s. Partial output:\n${out.trim() || '(none)'}`, code: -1 });
         return;
       }
-      // Only mark the session started on success — otherwise a failed first run
-      // would lock us into --continue against a session that never existed.
-      if (code === 0 && !state.sessionStarted) { state.sessionStarted = true; saveState(); }
+      // If --resume failed (session too old/missing), retry as a fresh session.
+      if (code !== 0 && state.sessionId && (errOut.includes('session') || errOut.includes('resume') || out.includes('session') || out.includes('resume'))) {
+        log(`session ${state.sessionId} rejected — resetting to fresh`);
+        state.sessionId = null;
+        saveState();
+        resolve({ ok: false, text: '__SESSION_EXPIRED__' });
+        return;
+      }
+      // Pin session ID after first successful run so all future messages resume the same thread.
+      if (code === 0 && !state.sessionId) {
+        const id = getNewestSessionId();
+        if (id) { state.sessionId = id; saveState(); log(`pinned session ${id}`); }
+      }
       const text = out.trim() || (errOut.trim() ? `(stderr) ${errOut.trim()}` : `(no output, exit=${code})`);
       resolve({ ok: code === 0, text, code });
     });
@@ -290,7 +320,7 @@ function startTyping() {
 }
 
 // Sentinel the agent prints to stdout when it has already delivered the answer via tg_send.
-// Daemon then suppresses the stdout relay entirely.
+// Daemon then suppresses the stdout relay entirely. See feedback_no_double_send_via_daemon.md.
 const TG_SENT_SENTINEL = /\[sent-via-tg\]/i;
 
 async function handleMessage(text) {
@@ -306,20 +336,28 @@ async function handleMessage(text) {
   const trimmed = stripAnsi(result || '').trim();
 
   if (!ok) {
-    // Errors always surface — user needs to know. Use rich mode so prose-style
-    // failures (e.g. "You've hit your limit") render cleanly; looksTabular()
-    // will auto-fall back to <pre> for stderr that looks like aligned output.
-    await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${trimmed || '(no output)'}`, { mode: 'rich' });
-    return;
+    // Session expired — retry fresh and notify user.
+    if (result === '__SESSION_EXPIRED__') {
+      log('session expired — retrying as fresh session');
+      await sendChunked('⚠️ Old session expired — started fresh. Context reset. Retrying your message...', { mode: 'rich' });
+      ({ ok, text: result, code } = await runClaude(text));
+      if (!ok) {
+        await sendChunked(`**Failed after session reset** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich' });
+        return;
+      }
+    } else {
+      await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${trimmed || '(no output)'}`, { mode: 'rich' });
+      return;
+    }
   }
 
-  // Agent signaled "I already sent the user-facing answer via tg_send" -> suppress relay.
+  // Agent signaled "I already sent the user-facing answer via tg_send" → suppress relay.
   if (TG_SENT_SENTINEL.test(trimmed)) {
     log(`relay suppressed: agent used tg_send sentinel (${dt}s, stdout=${trimmed.length} chars)`);
     return;
   }
 
-  // Nothing to say -> don't send an empty <pre>.
+  // Nothing to say → don't send an empty <pre>.
   if (!trimmed) {
     log(`relay suppressed: empty stdout (${dt}s)`);
     return;
@@ -371,4 +409,35 @@ async function pollLoop() {
 process.on('SIGINT', () => { log('SIGINT, exiting'); process.exit(0); });
 process.on('SIGTERM', () => { log('SIGTERM, exiting'); process.exit(0); });
 
+// ---------- Hermes queue poller ----------
+const HERMES_QUEUE = path.join(WORKDIR, '.claude-queue.json');
+
+function readHermesQueue() {
+  try { return JSON.parse(fs.readFileSync(HERMES_QUEUE, 'utf-8')); } catch { return null; }
+}
+function writeHermesQueue(obj) {
+  try { fs.writeFileSync(HERMES_QUEUE, JSON.stringify(obj, null, 2)); } catch (e) { log(`writeHermesQueue: ${e.message}`); }
+}
+
+async function hermesQueuePoll() {
+  setInterval(async () => {
+    if (busy) return;
+    const q = readHermesQueue();
+    if (!q || q.status !== 'pending') return;
+    log(`hermes-queue: picked up task ${q.id}`);
+    writeHermesQueue({ ...q, status: 'working', updated: new Date().toISOString() });
+    busy = true;
+    try {
+      const { ok, text: result } = await runClaude(q.task);
+      writeHermesQueue({ ...q, status: ok ? 'done' : 'error', [ok ? 'result' : 'error']: result, updated: new Date().toISOString() });
+      log(`hermes-queue: task ${q.id} ${ok ? 'done' : 'error'}`);
+    } catch (e) {
+      writeHermesQueue({ ...q, status: 'error', error: e.message, updated: new Date().toISOString() });
+      log(`hermes-queue: task ${q.id} threw: ${e.message}`);
+    }
+    busy = false;
+  }, 5000);
+}
+
 pollLoop().catch((e) => { log(`fatal: ${e.stack || e.message}`); process.exit(1); });
+hermesQueuePoll();
