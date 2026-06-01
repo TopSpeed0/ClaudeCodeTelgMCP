@@ -43,12 +43,12 @@ Copy-paste this single block — it clones the repo, creates your config, and op
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; Copy-Item .mcp.json.example .mcp.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; Copy-Item .mcp.json.example .mcp.json; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
 ```
 
 **macOS / Linux (bash):**
 ```bash
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git && cd ClaudeCodeTelgMCP && cp .mcp.json.example .mcp.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git && cd ClaudeCodeTelgMCP && cp .mcp.json.example .mcp.json && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
 ```
 
 After editing `.mcp.json` with your credentials:
@@ -57,6 +57,9 @@ claude
 ```
 
 That's it. Claude Code reads `.mcp.json`, auto-launches the Telegram MCP server, and you have `tg_send` + `tg_ask` tools ready.
+
+> **Note:** `.claude-queue.json` is created empty (`{}`) by the install command above.
+> The Hermes queue poller (`hermesQueuePoll`) watches this file — it must exist before starting the daemon.
 
 ### (Optional) Start the Task Daemon
 
