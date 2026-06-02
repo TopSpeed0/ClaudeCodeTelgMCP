@@ -15,10 +15,12 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
+const LOCK_FILE = path.join(WORKDIR, '.telegram-task-daemon.lock');
 const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.json');
 
 function log(msg) {
@@ -51,29 +53,34 @@ function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { log(`saveState: ${e.message}`); }
 }
 
-// ---------- Session tracking ----------
-const PROJECT_DIR = (() => {
-  // Claude stores sessions under ~/.claude/projects/<encoded-workdir>/
-  const encoded = WORKDIR.replace(/[/\\]/g, '-').replace(/^-/, '').replace(/:/g, '');
-  // Try both slash styles (Windows path encoded two ways)
-  const candidates = [
-    path.join(process.env.USERPROFILE || process.env.HOME, '.claude', 'projects', encoded),
-    path.join(process.env.USERPROFILE || process.env.HOME, '.claude', 'projects',
-      WORKDIR.replace(/\\/g, '-').replace(/^-/, '').replace(/:/g, '')),
-  ];
-  return candidates.find(p => fs.existsSync(p)) || candidates[0];
-})();
-
-function getNewestSessionId() {
-  try {
-    const files = fs.readdirSync(PROJECT_DIR)
-      .filter(f => /^[0-9a-f-]{36}\.jsonl$/.test(f))
-      .map(f => ({ f, mtime: fs.statSync(path.join(PROJECT_DIR, f)).mtimeMs }))
-      .sort((a, b) => b.mtime - a.mtime);
-    if (!files.length) return null;
-    return files[0].f.replace('.jsonl', '');
-  } catch { return null; }
+// ---------- Single-instance lock ----------
+// Two daemons long-polling the same bot fight over getUpdates (Telegram allows
+// only one consumer) and clobber each other's pinned session in the shared
+// state file. Refuse to start if a live instance already holds the lock.
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
+function acquireLock() {
+  try {
+    const prev = parseInt(fs.readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
+    if (prev && prev !== process.pid && pidAlive(prev)) {
+      log(`another daemon is already running (PID=${prev}); exiting`);
+      process.exit(0);
+    }
+  } catch (_) { /* no lock file yet */ }
+  try { fs.writeFileSync(LOCK_FILE, String(process.pid)); } catch (e) { log(`acquireLock: ${e.message}`); }
+}
+function releaseLock() {
+  try {
+    if (parseInt(fs.readFileSync(LOCK_FILE, 'utf-8').trim(), 10) === process.pid) fs.unlinkSync(LOCK_FILE);
+  } catch (_) {}
+}
+
+// ---------- Session tracking ----------
+// The daemon owns its session id deterministically: on a fresh start it mints a
+// UUID and passes it via --session-id, then always --resume that exact id. This
+// avoids guessing "the newest .jsonl in the project dir", which could pick up an
+// unrelated interactive Claude session running in the same workspace.
 
 function tgApi(method, params, { httpTimeoutMs } = {}) {
   return new Promise((resolve, reject) => {
@@ -247,14 +254,19 @@ const CLAUDE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max per task
 
 function runClaude(task) {
   return new Promise((resolve) => {
+    const resuming = !!state.sessionId;
+    // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
+    // fresh session and assign it via --session-id.
+    const sessionId = state.sessionId || crypto.randomUUID();
     const args = ['-p', task, '--model', 'claude-opus-4-6',
                   '--dangerously-skip-permissions',
                   '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
-    if (state.sessionId) {
-      args.push('--resume', state.sessionId);
-      log(`resuming session ${state.sessionId}`);
+    if (resuming) {
+      args.push('--resume', sessionId);
+      log(`resuming session ${sessionId}`);
     } else {
-      log('starting fresh session');
+      args.push('--session-id', sessionId);
+      log(`starting fresh session ${sessionId}`);
     }
     // Build the full cmd.exe command line ourselves and pass it verbatim,
     // so Node's spawn doesn't re-escape paths that already contain spaces.
@@ -288,18 +300,24 @@ function runClaude(task) {
         resolve({ ok: false, text: `Task timed out after ${CLAUDE_TIMEOUT_MS / 1000}s. Partial output:\n${out.trim() || '(none)'}`, code: -1 });
         return;
       }
-      // If --resume failed (session too old/missing), retry as a fresh session.
-      if (code !== 0 && state.sessionId && (errOut.includes('session') || errOut.includes('resume') || out.includes('session') || out.includes('resume'))) {
-        log(`session ${state.sessionId} rejected — resetting to fresh`);
+      // Reset to a fresh session ONLY when --resume genuinely failed. Match the
+      // specific resume-failure message Claude emits — NOT any stray occurrence
+      // of the words "session"/"resume", which would wipe context on unrelated
+      // task failures (the old bug behind "it forgot everything").
+      const RESUME_FAILED = /no conversation found|session (id )?.*(not found|invalid|expired)|could not (resume|find session)|unable to resume/i;
+      if (code !== 0 && resuming && RESUME_FAILED.test(errOut)) {
+        log(`session ${sessionId} rejected — resetting to fresh`);
         state.sessionId = null;
         saveState();
         resolve({ ok: false, text: '__SESSION_EXPIRED__' });
         return;
       }
-      // Pin session ID after first successful run so all future messages resume the same thread.
+      // Pin the (deterministic) session id after the first successful fresh run
+      // so every future message resumes this same thread.
       if (code === 0 && !state.sessionId) {
-        const id = getNewestSessionId();
-        if (id) { state.sessionId = id; saveState(); log(`pinned session ${id}`); }
+        state.sessionId = sessionId;
+        saveState();
+        log(`pinned session ${sessionId}`);
       }
       const text = out.trim() || (errOut.trim() ? `(stderr) ${errOut.trim()}` : `(no output, exit=${code})`);
       resolve({ ok: code === 0, text, code });
@@ -406,8 +424,9 @@ async function pollLoop() {
   }
 }
 
-process.on('SIGINT', () => { log('SIGINT, exiting'); process.exit(0); });
-process.on('SIGTERM', () => { log('SIGTERM, exiting'); process.exit(0); });
+process.on('SIGINT', () => { log('SIGINT, exiting'); releaseLock(); process.exit(0); });
+process.on('SIGTERM', () => { log('SIGTERM, exiting'); releaseLock(); process.exit(0); });
+process.on('exit', releaseLock);
 
 // ---------- Hermes queue poller ----------
 const HERMES_QUEUE = path.join(WORKDIR, '.claude-queue.json');
@@ -439,5 +458,6 @@ async function hermesQueuePoll() {
   }, 5000);
 }
 
-pollLoop().catch((e) => { log(`fatal: ${e.stack || e.message}`); process.exit(1); });
+acquireLock();
+pollLoop().catch((e) => { log(`fatal: ${e.stack || e.message}`); releaseLock(); process.exit(1); });
 hermesQueuePoll();

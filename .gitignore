@@ -10,6 +10,7 @@ CLAUDE.local.md
 # Runtime state files
 .telegram-state.json
 .telegram-task-state.json
+.telegram-task-daemon.lock
 
 # Daemon logs
 mcp/task-daemon.log
