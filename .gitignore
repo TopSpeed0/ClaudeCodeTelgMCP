@@ -2,6 +2,11 @@
 .telegram-config
 .mcp.json
 
+# Personal / local instructions — read by Claude but never committed.
+# Public users: drop your own private context here; it is gitignored.
+CLAUDE.local.md
+.claude/settings.local.json
+
 # Runtime state files
 .telegram-state.json
 .telegram-task-state.json
