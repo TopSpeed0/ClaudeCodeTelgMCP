@@ -12,6 +12,9 @@ CLAUDE.local.md
 .telegram-task-state.json
 .telegram-task-daemon.lock
 
+# Conversation archive (personal chat history + per-day summaries)
+archive/
+
 # Daemon logs
 mcp/task-daemon.log
 mcp/task-daemon.log.err
