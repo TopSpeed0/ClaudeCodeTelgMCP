@@ -325,8 +325,10 @@ function quoteForCmd(arg) {
   // cmd.exe-safe quoting: wrap in double quotes if it contains whitespace or quotes;
   // escape embedded quotes and trailing backslashes per Windows command-line rules.
   if (typeof arg !== 'string') arg = String(arg);
+  // Newlines inside the argument break cmd.exe command-line parsing — replace with space.
+  arg = arg.replace(/\r?\n/g, ' ');
   if (!/[\s"]/.test(arg)) return arg;
-  const escaped = arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1');
+  const escaped = arg.replace(/(\\")/g, '$1$1\\"').replace(/(\\+)$/, '$1$1');
   return `"${escaped}"`;
 }
 
