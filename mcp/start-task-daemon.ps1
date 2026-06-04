@@ -10,6 +10,49 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+
+# ── Requirements check ──
+$reqFile = Join-Path $repo 'requirements.txt'
+if (Test-Path $reqFile) {
+  Write-Host "`n[requirements] Checking dependencies..." -ForegroundColor Cyan
+  $failed = @()
+  Get-Content $reqFile | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' } | ForEach-Object {
+    $parts = $_ -split ':'
+    $type = $parts[0].Trim()
+    $name = $parts[1].Trim()
+    $minVer = $parts[2].Trim()
+    $checkCmd = $parts[3].Trim()
+
+    try {
+      $verRaw = & cmd /c "$checkCmd 2>&1" | Select-Object -First 1
+      $verMatch = [regex]::Match($verRaw, '(\d+\.\d+[\.\d]*)')
+      $verStr = if ($verMatch.Success) { $verMatch.Value } else { '?' }
+
+      if ($minVer -and $verMatch.Success) {
+        $actual = [Version]$verStr
+        $required = [Version]$minVer
+        if ($actual -lt $required) {
+          Write-Host "  ✗ $name — found $verStr, need >= $minVer" -ForegroundColor Red
+          $failed += $name
+        } else {
+          Write-Host "  ✓ $name $verStr" -ForegroundColor Green
+        }
+      } else {
+        Write-Host "  ✓ $name $verStr" -ForegroundColor Green
+      }
+    } catch {
+      Write-Host "  ✗ $name — NOT FOUND (run: npm install -g $name)" -ForegroundColor Red
+      $failed += $name
+    }
+  }
+
+  if ($failed.Count -gt 0) {
+    Write-Host "`n[requirements] Missing: $($failed -join ', ')" -ForegroundColor Red
+    Write-Host "[requirements] Fix and re-run." -ForegroundColor Yellow
+    exit 1
+  }
+  Write-Host "[requirements] All OK`n" -ForegroundColor Green
+}
 $daemon = Join-Path $PSScriptRoot 'telegram-task-daemon.js'
 $logFile = Join-Path $PSScriptRoot 'task-daemon.log'
 

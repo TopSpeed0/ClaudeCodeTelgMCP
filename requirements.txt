@@ -1,0 +1,12 @@
+# requirements.txt — ClaudeCodeTelgMCP runtime dependencies
+#
+# Format:
+#   type:name:min_version:check_command
+#
+# type = node | npm-global | binary
+# min_version = optional (leave empty to skip version check)
+# check_command = command to verify installation
+
+node::18.0.0:node --version
+npm-global:@anthropic-ai/claude-code:0.2.0:claude --version
+binary:git::git --version
