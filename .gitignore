@@ -1,6 +1,7 @@
 # Credentials — NEVER commit these
 .telegram-config
 .mcp.json
+jira.json
 
 # Personal / local instructions — read by Claude but never committed.
 # Public users: drop your own private context here; it is gitignored.
@@ -25,3 +26,4 @@ Thumbs.db
 *.swp
 .vscode/
 .claude-queue.json
+*.tmp
