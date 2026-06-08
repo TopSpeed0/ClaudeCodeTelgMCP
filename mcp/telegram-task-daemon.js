@@ -51,12 +51,21 @@ function loadConfig() {
 
 const config = loadConfig();
 
-let state = { updateOffset: 0, sessionId: null, day: null, summary: '' };
+let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null };
 try {
   const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
   // Migrate old sessionStarted boolean → sessionId
   if (raw.sessionStarted !== undefined) delete raw.sessionStarted;
   state = { ...state, ...raw };
+  // Auto-expire session after 2 hours of inactivity — prevents resuming a dead session.
+  const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+  if (state.sessionId && state.lastActivity) {
+    const idle = Date.now() - new Date(state.lastActivity).getTime();
+    if (idle > SESSION_TTL_MS) {
+      log(`session ${state.sessionId} expired after ${Math.round(idle/60000)}m idle — starting fresh`);
+      state.sessionId = null;
+    }
+  }
 } catch (_) {}
 function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); } catch (e) { log(`saveState: ${e.message}`); }
@@ -431,6 +440,7 @@ async function runClaude(task, { contextPrefix } = {}) {
     state.sessionId = sessionId; saveState();
     log(`pinned session ${sessionId} (no json envelope)`);
   }
+  if (code === 0) { state.lastActivity = new Date().toISOString(); saveState(); }
 
   const text = answer.trim() || (errOut.trim() ? `(stderr) ${errOut.trim()}` : `(no output, exit=${code})`);
   return { ok: code === 0, text, code, forked, actualId };
