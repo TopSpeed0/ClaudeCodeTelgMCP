@@ -332,7 +332,7 @@ function quoteForCmd(arg) {
   return `"${escaped}"`;
 }
 
-const CLAUDE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max per task
+const CLAUDE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max per task
 
 // Low-level spawn of `claude -p` with the given extra args. Pure: collects
 // stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
@@ -358,9 +358,14 @@ function claudeRaw(task, extraArgs) {
     const timer = setTimeout(() => {
       killed = true;
       log(`timeout: killing claude after ${CLAUDE_TIMEOUT_MS / 1000}s`);
-      try { proc.kill('SIGTERM'); } catch (_) {}
-      // On Windows cmd.exe doesn't always forward signals — force-kill after 5s.
-      setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000);
+      // On Windows, proc is cmd.exe — killing it leaves claude.exe running as an orphan.
+      // taskkill /F /T kills the entire process tree (cmd.exe + claude.exe children).
+      if (process.platform === 'win32') {
+        try { require('child_process').execSync(`taskkill /F /T /PID ${proc.pid}`, { timeout: 5000 }); } catch (_) {}
+      } else {
+        try { proc.kill('SIGTERM'); } catch (_) {}
+        setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000);
+      }
     }, CLAUDE_TIMEOUT_MS);
     proc.on('close', (code) => { clearTimeout(timer); resolve({ code, out, errOut, killed }); });
   });
