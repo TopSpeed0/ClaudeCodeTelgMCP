@@ -35,7 +35,25 @@ Install all three in any order — one line each:
 | **PowerShell 7+** | `winget install Microsoft.PowerShell` | `brew install powershell` / [install docs](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-linux) |
 | **Claude Code** | `npm install -g @anthropic-ai/claude-code` | `npm install -g @anthropic-ai/claude-code` |
 
-> After installing Claude Code, run `claude` once to authenticate with your Anthropic account.
+#### First-Time Claude Code Authentication
+
+After installing, run `claude` once to authenticate. You have two options:
+
+| Method | How |
+|--------|-----|
+| **Browser login** (recommended) | Run `claude` — it opens a browser for Anthropic OAuth. Sign in, approve, done. |
+| **API key** | Set `ANTHROPIC_API_KEY` as an environment variable before running `claude`. Skips the browser flow entirely. |
+
+```powershell
+# Option A — browser login (interactive, one-time)
+claude
+
+# Option B — API key (headless / CI / servers)
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+claude
+```
+
+> **Headless servers**: If the machine has no browser (e.g., the task daemon runs on a server), use the API key method.
 
 ### One-Prompt Install
 
