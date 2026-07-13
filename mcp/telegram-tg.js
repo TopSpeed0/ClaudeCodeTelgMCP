@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 // telegram-tg.js — Zero-dependency Telegram MCP server (stdio).
-// Exposes two tools to the agent:
-//   tg_send  — one-way notification ("ACTION NEEDED in VS Code", etc.)
-//   tg_ask   — send a question and block until the user replies on Telegram.
+// Exposes these tools to the agent:
+//   tg_send   — one-way notification (optionally attach a file via file_path)
+//   tg_ask    — send a question and block until the user replies (optional
+//               inline-keyboard quick replies via choices[]; empty = silent poll)
+//   tg_edit   — edit a previously sent message in place (progress updates)
+//   tg_react  — put an emoji reaction on a message (lightweight acknowledge)
+//   tg_typing — show typing indicator
 //
 // Config resolution (first match wins):
 //   1. Env vars TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
@@ -13,6 +17,15 @@
 // All non-protocol output (errors, debug) goes to stderr — never stdout.
 
 'use strict';
+
+// Re-exec with --use-system-ca when launched without it (corporate TLS proxy workaround).
+if (!process.execArgv.includes('--use-system-ca')) {
+  const { spawn } = require('child_process');
+  const child = spawn(process.execPath, ['--use-system-ca', ...process.execArgv, __filename, ...process.argv.slice(2)], { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code ?? 1));
+  return;
+}
+
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -43,6 +56,7 @@ function loadConfig() {
 let config;
 try {
   config = loadConfig();
+  process.stderr.write(`[telegram-tg] loaded token=${config.bot_token?.slice(0,8)}... chat=${config.chat_id} execArgv=${JSON.stringify(process.execArgv)}\n`);
 } catch (e) {
   process.stderr.write(`[telegram-tg] ${e.message}\n`);
   process.exit(1);
@@ -98,6 +112,79 @@ function tgApi(method, params, { httpTimeoutMs } = {}) {
   });
 }
 
+// ---------- Multipart file upload helper ----------
+// Telegram file-sending endpoints (sendDocument/sendPhoto/...) need
+// multipart/form-data, not JSON. Node's built-in https can do this with no deps.
+function tgApiMultipart(method, fields, fileField, filePath, { httpTimeoutMs } = {}) {
+  return new Promise((resolve, reject) => {
+    let fileBuf;
+    try {
+      fileBuf = fs.readFileSync(filePath);
+    } catch (e) {
+      return reject(new Error(`Cannot read file "${filePath}": ${e.message}`));
+    }
+    const filename = path.basename(filePath);
+    const boundary = '----telegramTgBoundary' + Date.now() + Math.random().toString(16).slice(2);
+    const pre = [];
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined || v === null) continue;
+      pre.push(`--${boundary}\r\n`);
+      pre.push(`Content-Disposition: form-data; name="${k}"\r\n\r\n`);
+      pre.push(`${v}\r\n`);
+    }
+    pre.push(`--${boundary}\r\n`);
+    pre.push(`Content-Disposition: form-data; name="${fileField}"; filename="${filename}"\r\n`);
+    pre.push('Content-Type: application/octet-stream\r\n\r\n');
+    const head = Buffer.from(pre.join(''), 'utf-8');
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8');
+    const body = Buffer.concat([head, fileBuf, tail]);
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      port: 443,
+      path: `/bot${config.bot_token}/${method}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (!parsed.ok) {
+            reject(new Error(`Telegram ${method} failed: ${parsed.description || data}`));
+          } else {
+            resolve(parsed.result);
+          }
+        } catch (e) {
+          reject(new Error(`Telegram ${method} parse error: ${e.message} (raw: ${data.slice(0, 200)})`));
+        }
+      });
+    });
+    req.on('error', reject);
+    if (httpTimeoutMs) {
+      req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`Telegram ${method} HTTP timeout after ${httpTimeoutMs}ms`)));
+    }
+    req.write(body);
+    req.end();
+  });
+}
+
+// Pick the right Telegram method + form field based on file extension.
+function pickFileMethod(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return { method: 'sendPhoto', field: 'photo' };
+  if (ext === '.ogg') return { method: 'sendVoice', field: 'voice' };
+  if (['.mp4', '.mov'].includes(ext)) return { method: 'sendVideo', field: 'video' };
+  if (['.mp3', '.m4a', '.wav', '.flac'].includes(ext)) return { method: 'sendAudio', field: 'audio' };
+  return { method: 'sendDocument', field: 'document' };
+}
+
+// Tracks the most recent inbound message id so tg_react can default to it.
+let lastReceivedMessageId = null;
+
 // ---------- Tool implementations ----------
 // Accepted parse_mode values per Telegram Bot API.
 const PARSE_MODES = new Set(['HTML', 'MarkdownV2', 'Markdown']);
@@ -111,44 +198,158 @@ function normalizeParseMode(parseMode) {
   return pm;
 }
 
-async function tgSend(text, parseMode) {
+// A self-sustaining "typing..." keeper. A single sendChatAction only lasts ~5s,
+// so after a message is caught the indicator would fade while the agent is still
+// generating its reply. The keeper pulses every 4s until the next outbound
+// message is sent, with a 2-min safety cap so it can never leak.
+let typingKeeperTimer = null;
+function startTypingKeeper(chatId) {
+  stopTypingKeeper();
+  const target = chatId || config.chat_id;
+  const pulse = () => {
+    tgApi('sendChatAction', { chat_id: target, action: 'typing' }).catch(() => {});
+  };
+  pulse();
+  let elapsed = 0;
+  typingKeeperTimer = setInterval(() => {
+    elapsed += 4000;
+    if (elapsed >= 120000) { stopTypingKeeper(); return; }
+    pulse();
+  }, 4000);
+  if (typingKeeperTimer.unref) typingKeeperTimer.unref();
+}
+function stopTypingKeeper() {
+  if (typingKeeperTimer) {
+    clearInterval(typingKeeperTimer);
+    typingKeeperTimer = null;
+  }
+}
+
+async function tgSend(text, parseMode, opts = {}) {
+  // Any outbound message ends the "typing..." state.
+  stopTypingKeeper();
+  const chatId = opts.chat_id || config.chat_id;
+  const pm = normalizeParseMode(parseMode);
+
+  // File attachment path: pick method by extension and multipart-upload.
+  if (opts.file_path) {
+    const { method, field } = pickFileMethod(opts.file_path);
+    const fields = { chat_id: chatId };
+    if (opts.thread_id != null) fields.message_thread_id = opts.thread_id;
+    if (text) fields.caption = text;
+    if (pm) fields.parse_mode = pm;
+    const msg = await tgApiMultipart(method, fields, field, opts.file_path, { httpTimeoutMs: 120000 });
+    return `Sent file via ${method} (message_id=${msg.message_id}).`;
+  }
+
   const payload = {
-    chat_id: config.chat_id,
+    chat_id: chatId,
     text,
     disable_web_page_preview: true,
   };
-  const pm = normalizeParseMode(parseMode);
+  if (opts.thread_id != null) payload.message_thread_id = opts.thread_id;
   if (pm) payload.parse_mode = pm;
   const msg = await tgApi('sendMessage', payload);
   return `Sent (message_id=${msg.message_id}${pm ? `, parse_mode=${pm}` : ''}).`;
 }
 
-async function tgAsk(question, timeoutSeconds, parseMode) {
-  const timeoutMs = Math.max(5, Math.min(3600, Number(timeoutSeconds) || 300)) * 1000;
+// Edit a previously sent message in place — progress updates without chat spam.
+async function tgEdit(messageId, text, parseMode, opts = {}) {
+  if (messageId == null) throw new Error('tg_edit requires "message_id".');
+  const chatId = opts.chat_id || config.chat_id;
   const pm = normalizeParseMode(parseMode);
+  const payload = {
+    chat_id: chatId,
+    message_id: Number(messageId),
+    text,
+    disable_web_page_preview: true,
+  };
+  if (pm) payload.parse_mode = pm;
+  const msg = await tgApi('editMessageText', payload);
+  return `Edited message_id=${msg.message_id}.`;
+}
 
-  // Drain pending updates so we never pick up an old, unrelated message.
-  try {
-    const drain = await tgApi('getUpdates', { offset: -1, timeout: 0 }, { httpTimeoutMs: 5000 });
-    if (drain.length) {
-      updateOffset = drain[drain.length - 1].update_id + 1;
-      saveState();
+// Put an emoji reaction on a message — a lightweight "acknowledged" signal.
+// Defaults to the last inbound message + 👀.
+async function tgReact(messageId, emoji, opts = {}) {
+  const chatId = opts.chat_id || config.chat_id;
+  const id = messageId != null ? Number(messageId) : lastReceivedMessageId;
+  if (id == null) {
+    throw new Error('tg_react: no message_id given and no message received yet this session.');
+  }
+  const e = emoji && String(emoji).trim() ? String(emoji).trim() : '👀';
+  await tgApi('setMessageReaction', {
+    chat_id: chatId,
+    message_id: id,
+    reaction: [{ type: 'emoji', emoji: e }],
+  });
+  return `Reacted ${e} to message_id=${id}.`;
+}
+
+// Show a "typing..." indicator for a fixed duration (refreshes every 4s).
+async function tgTyping(seconds, action) {
+  const total = Math.max(1, Math.min(60, Number(seconds) || 5));
+  const act = action && String(action).trim() ? String(action).trim() : 'typing';
+  const deadline = Date.now() + total * 1000;
+  let pulses = 0;
+  while (Date.now() < deadline) {
+    await tgApi('sendChatAction', { chat_id: config.chat_id, action: act });
+    pulses++;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(r => setTimeout(r, Math.min(4000, remaining)));
+  }
+  return `Sent ${pulses} "${act}" pulse${pulses === 1 ? '' : 's'} over ${total}s.`;
+}
+
+async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
+  const timeoutMs = Math.max(5, Math.min(36000, Number(timeoutSeconds) || 300)) * 1000;
+  const pm = normalizeParseMode(parseMode);
+  const silent = !question || !question.trim();
+  const chatId = opts.chat_id || config.chat_id;
+  const choices = Array.isArray(opts.choices) && opts.choices.length ? opts.choices.map(String) : null;
+
+  // Drain pending updates ONLY for interactive questions, so a stale, unrelated
+  // message isn't mistaken for the reply. For silent polls, NEVER drain: doing
+  // so discards messages that arrived in the gap between polls. The persisted
+  // updateOffset already prevents re-consuming old messages.
+  if (!silent) {
+    try {
+      const drain = await tgApi('getUpdates', { offset: -1, timeout: 0 }, { httpTimeoutMs: 5000 });
+      if (drain.length) {
+        updateOffset = drain[drain.length - 1].update_id + 1;
+        saveState();
+      }
+    } catch (e) {
+      process.stderr.write(`[telegram-tg] drain warning: ${e.message}\n`);
     }
-  } catch (e) {
-    process.stderr.write(`[telegram-tg] drain warning: ${e.message}\n`);
   }
 
-  // Send the question.
-  const trailer = (pm === 'MarkdownV2' || pm === 'Markdown') ? '' : '\n\n(reply to this chat — agent is waiting)';
-  const sendPayload = {
-    chat_id: config.chat_id,
-    text: pm ? `${question}${trailer}` : `${question}${trailer}`,
-  };
-  if (pm) sendPayload.parse_mode = pm;
-  const sent = await tgApi('sendMessage', sendPayload);
-  const questionMessageId = sent.message_id;
+  let questionMessageId = null;
+  let sentDate = Math.floor(Date.now() / 1000);
 
-  // Long-poll for a reply.
+  if (!silent) {
+    stopTypingKeeper();
+    const sendPayload = {
+      chat_id: chatId,
+      text: question,
+    };
+    if (pm) sendPayload.parse_mode = pm;
+    if (opts.thread_id != null) sendPayload.message_thread_id = opts.thread_id;
+    // Inline-keyboard quick replies: one tappable button per choice.
+    if (choices) {
+      sendPayload.reply_markup = {
+        inline_keyboard: choices.map((c, i) => [{ text: c, callback_data: String(i) }]),
+      };
+    }
+    const sent = await tgApi('sendMessage', sendPayload);
+    questionMessageId = sent.message_id;
+    sentDate = sent.date;
+  }
+
+  // Long-poll for a reply. When we offered buttons, also listen for the
+  // callback_query that fires when the operator taps one.
+  const allowedUpdates = choices ? ['message', 'callback_query'] : ['message'];
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const remainingSec = Math.max(1, Math.min(50, Math.floor((deadline - Date.now()) / 1000)));
@@ -157,7 +358,7 @@ async function tgAsk(question, timeoutSeconds, parseMode) {
       updates = await tgApi('getUpdates', {
         offset: updateOffset,
         timeout: remainingSec,
-        allowed_updates: ['message'],
+        allowed_updates: allowedUpdates,
       }, { httpTimeoutMs: (remainingSec + 10) * 1000 });
     } catch (e) {
       process.stderr.write(`[telegram-tg] getUpdates: ${e.message} — retrying\n`);
@@ -167,15 +368,30 @@ async function tgAsk(question, timeoutSeconds, parseMode) {
     for (const u of updates) {
       updateOffset = u.update_id + 1;
       saveState();
+
+      // A tapped inline-keyboard button arrives as a callback_query.
+      if (u.callback_query) {
+        const cq = u.callback_query;
+        if (cq.message && String(cq.message.chat.id) !== String(chatId)) continue;
+        tgApi('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
+        if (cq.message) lastReceivedMessageId = cq.message.message_id;
+        startTypingKeeper(chatId);
+        const idx = Number(cq.data);
+        return choices && Number.isInteger(idx) && choices[idx] != null ? choices[idx] : String(cq.data);
+      }
+
       const m = u.message;
       if (!m) continue;
-      if (String(m.chat.id) !== String(config.chat_id)) continue;
-      if (m.date && m.date * 1000 < sent.date * 1000 - 5000) continue;
+      if (String(m.chat.id) !== String(chatId)) continue;
+      if (m.date && m.date * 1000 < sentDate * 1000 - 5000) continue;
+      lastReceivedMessageId = m.message_id;
       const text = m.text || m.caption || '(non-text message)';
+      // Auto-start a sustained typing indicator the instant a message is caught.
+      startTypingKeeper(chatId);
       return text;
     }
   }
-  throw new Error(`No Telegram reply within ${timeoutMs / 1000}s (question message_id=${questionMessageId}).`);
+  throw new Error(`No Telegram reply within ${timeoutMs / 1000}s${questionMessageId ? ` (question message_id=${questionMessageId})` : ' (silent poll)'}. Timed out.`);
 }
 
 // ---------- MCP stdio JSON-RPC plumbing ----------
@@ -188,27 +404,69 @@ const PARSE_MODE_SCHEMA = {
 const TOOLS = [
   {
     name: 'tg_send',
-    description: 'Send a one-way notification to the operator via Telegram. Use when the agent needs human attention (e.g., approval pending, long task finished, error needs eyes). Fire-and-forget — does not wait for a reply. Pass parse_mode:"HTML" to use rich formatting.',
+    description: 'Send a one-way notification to the operator via Telegram. Use when the agent needs human attention (e.g., approval pending, long task finished, error needs eyes). Fire-and-forget — does not wait for a reply. Pass parse_mode:"HTML" to use rich formatting. Pass file_path to attach an image/video/audio/document (rendered inline by type). Returns the sent message_id (usable with tg_edit / tg_react).',
     inputSchema: {
       type: 'object',
       properties: {
-        text:       { type: 'string', description: 'Notification text. If parse_mode is set, callers must escape per Telegram rules.' },
+        text:       { type: 'string', description: 'Notification text. When file_path is set this becomes the file caption. If parse_mode is set, callers must escape per Telegram rules.' },
         parse_mode: PARSE_MODE_SCHEMA,
+        file_path:  { type: 'string', description: 'Optional absolute path to a file to attach. Type is auto-detected: .png/.jpg/.webp/.gif → photo, .mp4/.mov → video, .ogg → voice, .mp3/.m4a/.wav → audio, anything else → document.' },
+        chat_id:    { type: 'string', description: 'Optional target chat id. Defaults to the configured operator chat.' },
+        thread_id:  { type: 'number', description: 'Optional Telegram Topic (message_thread_id) to post into.' },
       },
       required: ['text'],
     },
   },
   {
     name: 'tg_ask',
-    description: 'Ask the operator a question via Telegram and BLOCK until they reply. Returns the reply text. Use for confirmations, choices, or clarifications when the agent is uncertain. Pass parse_mode:"HTML" to render bold/code/links in the question.',
+    description: 'Ask the operator a question via Telegram and BLOCK until they reply. Returns the reply text. Use for confirmations, choices, or clarifications when the agent is uncertain. Pass parse_mode:"HTML" to render bold/code/links. Pass choices:[...] to show tappable quick-reply buttons — the tapped option is returned. If question is empty or omitted, silently waits for the next message without sending anything.',
     inputSchema: {
       type: 'object',
       properties: {
-        question:       { type: 'string', description: 'The question to send.' },
-        timeoutSeconds: { type: 'number', description: 'Max seconds to wait for a reply (default 300, max 3600).' },
+        question:       { type: 'string', description: 'The question to send. If empty or omitted, silently polls for the next message.' },
+        timeoutSeconds: { type: 'number', description: 'Max seconds to wait for a reply (default 300, max 36000).' },
         parse_mode:     PARSE_MODE_SCHEMA,
+        choices:        { type: 'array', items: { type: 'string' }, description: 'Optional list of quick-reply options. Renders as inline-keyboard buttons; the tapped option text is returned.' },
+        chat_id:        { type: 'string', description: 'Optional target chat id. Defaults to the configured operator chat.' },
+        thread_id:      { type: 'number', description: 'Optional Telegram Topic (message_thread_id) to post the question into.' },
       },
-      required: ['question'],
+    },
+  },
+  {
+    name: 'tg_edit',
+    description: 'Edit a previously sent message in place. Use for progress updates: tg_send "⏳ Working..." → capture the message_id → tg_edit it to "✅ Done". Keeps the chat clean instead of posting a new message each step.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'number', description: 'The message_id returned by a prior tg_send.' },
+        text:       { type: 'string', description: 'The new text for the message.' },
+        parse_mode: PARSE_MODE_SCHEMA,
+        chat_id:    { type: 'string', description: 'Optional chat id if the message is not in the default operator chat.' },
+      },
+      required: ['message_id', 'text'],
+    },
+  },
+  {
+    name: 'tg_react',
+    description: 'Put an emoji reaction on a message — a lightweight "acknowledged" signal without sending a reply. Defaults to the most recent inbound message and the 👀 emoji if not specified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message_id: { type: 'number', description: 'Message to react to. Defaults to the last message received this session.' },
+        emoji:      { type: 'string', description: 'Reaction emoji (default 👀). Must be one Telegram supports, e.g. 👍 ❤️ 🔥 👀 🎉 👏 🙏.' },
+        chat_id:    { type: 'string', description: 'Optional chat id if not the default operator chat.' },
+      },
+    },
+  },
+  {
+    name: 'tg_typing',
+    description: 'Show a "typing..." indicator in the operator\'s Telegram chat. Blocks for the requested duration, refreshing every 4s.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'number', description: 'How long to keep the indicator visible (1-60, default 5).' },
+        action:  { type: 'string', enum: ['typing', 'upload_photo', 'record_video', 'upload_video', 'record_voice', 'upload_voice', 'upload_document', 'choose_sticker', 'find_location', 'record_video_note', 'upload_video_note'], description: 'Telegram chat action. Default "typing".' },
+      },
     },
   },
 ];
@@ -241,11 +499,24 @@ async function handle(req) {
     try {
       let text;
       if (name === 'tg_send') {
-        if (!args.text) throw new Error('tg_send requires "text".');
-        text = await tgSend(String(args.text), args.parse_mode);
+        if (!args.text && !args.file_path) throw new Error('tg_send requires "text" or "file_path".');
+        text = await tgSend(args.text ? String(args.text) : '', args.parse_mode, {
+          file_path: args.file_path,
+          chat_id: args.chat_id,
+          thread_id: args.thread_id,
+        });
       } else if (name === 'tg_ask') {
-        if (!args.question) throw new Error('tg_ask requires "question".');
-        text = await tgAsk(String(args.question), args.timeoutSeconds, args.parse_mode);
+        text = await tgAsk(args.question ? String(args.question) : '', args.timeoutSeconds, args.parse_mode, {
+          choices: args.choices,
+          chat_id: args.chat_id,
+          thread_id: args.thread_id,
+        });
+      } else if (name === 'tg_edit') {
+        text = await tgEdit(args.message_id, String(args.text), args.parse_mode, { chat_id: args.chat_id });
+      } else if (name === 'tg_react') {
+        text = await tgReact(args.message_id, args.emoji, { chat_id: args.chat_id });
+      } else if (name === 'tg_typing') {
+        text = await tgTyping(args.seconds, args.action);
       } else {
         throw new Error(`Unknown tool: ${name}`);
       }

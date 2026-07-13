@@ -458,6 +458,78 @@ function startTyping() {
   return () => clearInterval(interval);
 }
 
+// ---------- Rich Telegram helpers (reactions, editing, file uploads) ----------
+// Emoji reaction — a lightweight "acknowledged" signal (👀 on pickup, 🎉 on done).
+// Note: Telegram only allows a fixed emoji set for reactions (👍👀🎉🔥❤️👏🙏 etc).
+function tgReact(messageId, emoji) {
+  if (messageId == null) return Promise.resolve();
+  return tgApi('setMessageReaction', {
+    chat_id: config.chat_id,
+    message_id: messageId,
+    reaction: [{ type: 'emoji', emoji: emoji || '👀' }],
+  }).catch(e => log(`react: ${e.message}`));
+}
+
+// Edit a previously sent message in place (live progress, no chat spam).
+function tgEdit(messageId, text, { parse_mode } = {}) {
+  return tgApi('editMessageText', {
+    chat_id: config.chat_id,
+    message_id: messageId,
+    text,
+    parse_mode,
+    disable_web_page_preview: true,
+  }).catch(e => log(`edit: ${e.message}`));
+}
+
+// Pick the right Telegram method + form field based on file extension.
+function pickFileMethod(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return { method: 'sendPhoto', field: 'photo' };
+  if (ext === '.ogg') return { method: 'sendVoice', field: 'voice' };
+  if (['.mp4', '.mov'].includes(ext)) return { method: 'sendVideo', field: 'video' };
+  if (['.mp3', '.m4a', '.wav', '.flac'].includes(ext)) return { method: 'sendAudio', field: 'audio' };
+  return { method: 'sendDocument', field: 'document' };
+}
+
+// Multipart upload so the daemon can attach screenshots / logs / reports.
+function tgSendFile(filePath, caption) {
+  return new Promise((resolve, reject) => {
+    let fileBuf;
+    try { fileBuf = fs.readFileSync(filePath); }
+    catch (e) { return reject(new Error(`Cannot read file "${filePath}": ${e.message}`)); }
+    const { method, field } = pickFileMethod(filePath);
+    const filename = path.basename(filePath);
+    const boundary = '----tgBoundary' + Date.now() + Math.random().toString(16).slice(2);
+    const fields = { chat_id: config.chat_id };
+    if (caption) fields.caption = caption;
+    const pre = [];
+    for (const [k, v] of Object.entries(fields)) {
+      pre.push(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`);
+    }
+    pre.push(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+    const body = Buffer.concat([
+      Buffer.from(pre.join(''), 'utf-8'),
+      fileBuf,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8'),
+    ]);
+    const req = https.request({
+      hostname: 'api.telegram.org', port: 443,
+      path: `/bot${config.bot_token}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => {
+        try { const p = JSON.parse(data); p.ok ? resolve(p.result) : reject(new Error(`${method}: ${p.description || data}`)); }
+        catch (e) { reject(new Error(`${method} parse: ${e.message}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error(`${method} timeout`)));
+    req.write(body); req.end();
+  });
+}
+
 // Sentinel the agent prints to stdout when it has already delivered the answer via tg_send.
 // Daemon then suppresses the stdout relay entirely. See feedback_no_double_send_via_daemon.md.
 const TG_SENT_SENTINEL = /\[sent-via-tg\]/i;
@@ -524,7 +596,7 @@ async function buildRestoreContext() {
   return `[Context restore — the previous session could not be resumed; here is our conversation so far so you can continue seamlessly]\n\n${parts.join('\n\n')}`;
 }
 
-async function handleMessage(rawText) {
+async function handleMessage(rawText, msgId) {
   await rolloverIfNewDay();
   const stopTyping = startTyping();
   const t0 = Date.now();
@@ -560,6 +632,7 @@ async function handleMessage(rawText) {
   }
 
   if (!ok) {
+    await tgReact(msgId, '💔');
     await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich' });
     return;
   }
@@ -600,6 +673,7 @@ async function handleMessage(rawText) {
   // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
   // with the looksTabular() <pre> fallback inside sendChunked.
   await sendChunked(trimmed, { mode: 'rich' });
+  await tgReact(msgId, '🎉');
 }
 
 let busy = false;
@@ -632,7 +706,8 @@ async function pollLoop() {
         continue;
       }
       busy = true;
-      try { await handleMessage(m.text); }
+      tgReact(m.message_id, '👀');
+      try { await handleMessage(m.text, m.message_id); }
       catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`, { mode: 'plain' }); } catch (_) {} }
       busy = false;
     }
