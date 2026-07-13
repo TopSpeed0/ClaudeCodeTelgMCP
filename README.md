@@ -17,7 +17,7 @@ A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-
 | `mcp/telegram-task-daemon.js` | Always-on bridge: Telegram messages become `claude -p` tasks |
 | `mcp/start-task-daemon.ps1` | Launcher with auto-restart (foreground or background) |
 | `mcp/install-shortcuts.ps1` | Windows Start Menu + Desktop shortcut creator |
-| `mcp/daemon-mcp.json` | Empty MCP config for daemon-spawned sessions |
+| `mcp/daemon-mcp.json` | MCP config for daemon-spawned sessions (placeholder env vars — real creds loaded from `.telegram-config`) |
 | `CLAUDE.md` | Workspace instructions for Claude Code |
 | `.mcp.json.example` | Template — copy to `.mcp.json` and add your credentials |
 | `.claude/settings.local.json` | Pre-configured permissions for PowerShell, Node, Telegram tools |

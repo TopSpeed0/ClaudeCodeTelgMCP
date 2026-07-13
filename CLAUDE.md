@@ -27,7 +27,7 @@ Features:
 - ANSI-strip for clean monospace output
 - Cross-platform: auto-detects Windows vs macOS/Linux for process spawning
 
-**Important:** `mcp/daemon-mcp.json` must include the `telegram-tg` server config so daemon-spawned Claude sessions can use `tg_send` for rich formatting. If it's empty (`{}`), the spawned sessions have no MCP tools and fall back to plain stdout — causing ugly monospace replies instead of rich HTML.
+**Important:** `mcp/daemon-mcp.json` tells daemon-spawned Claude sessions to start `telegram-tg`. It ships with placeholder env vars (`YOUR_BOT_TOKEN_HERE`) — this is intentional. The server's `loadConfig()` detects placeholders and falls through to `.telegram-config` in the workspace root (which holds your real credentials and is gitignored). If neither source has valid credentials, the server exits with an error.
 
 ### Launcher — `mcp/start-task-daemon.ps1`
 PowerShell 7+ script to start the daemon in foreground or background mode. Auto-kills any previous daemon instance on restart.
