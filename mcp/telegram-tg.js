@@ -35,7 +35,8 @@ const readline = require('readline');
 function loadConfig() {
   const envToken = process.env.TELEGRAM_BOT_TOKEN;
   const envChat  = process.env.TELEGRAM_CHAT_ID;
-  if (envToken && envChat) {
+  const isPlaceholder = (v) => !v || v.startsWith('YOUR_');
+  if (envToken && envChat && !isPlaceholder(envToken) && !isPlaceholder(envChat)) {
     return { bot_token: envToken, chat_id: envChat };
   }
   const cfgPath = path.join(process.cwd(), '.telegram-config');
@@ -56,7 +57,6 @@ function loadConfig() {
 let config;
 try {
   config = loadConfig();
-  process.stderr.write(`[telegram-tg] loaded token=${config.bot_token?.slice(0,8)}... chat=${config.chat_id} execArgv=${JSON.stringify(process.execArgv)}\n`);
 } catch (e) {
   process.stderr.write(`[telegram-tg] ${e.message}\n`);
   process.exit(1);
@@ -78,10 +78,11 @@ function saveState() {
 function tgApi(method, params, { httpTimeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(params || {});
+    const urlPath = `/bot${config.bot_token}/${method}`;
     const req = https.request({
       hostname: 'api.telegram.org',
       port: 443,
-      path: `/bot${config.bot_token}/${method}`,
+      path: urlPath,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
