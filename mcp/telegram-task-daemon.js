@@ -29,7 +29,37 @@ const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.json');
 // per day. On a silent fork (or daily reboot) we restore from these.
 const ARCHIVE_DIR = path.join(WORKDIR, 'archive');
 const DAILY_SUMMARIES_FILE = path.join(ARCHIVE_DIR, 'daily-summaries.json');
-const RECENT_TURNS = 10;     // verbatim turns kept in the recovery window
+const RUNTIME_CONFIG_FILE = path.join(WORKDIR, 'agent-runtime.json');
+
+// Runtime policy is local-only. The tracked agent-runtime.example.json documents
+// the supported shape; edits apply on the next daemon restart.
+const DEFAULT_RUNTIME = {
+  defaults: { model: 'gpt-5.6-terra', reasoning_effort: 'high', recent_turns: 10, summary_days: 1 },
+  agents: { claude: { model: 'claude-opus-5', fallback_model: 'claude-opus-4.6' } },
+};
+function loadRuntimeConfig() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, 'utf-8'));
+    return {
+      ...DEFAULT_RUNTIME,
+      ...parsed,
+      defaults: { ...DEFAULT_RUNTIME.defaults, ...(parsed.defaults || {}) },
+      agents: {
+        ...DEFAULT_RUNTIME.agents,
+        ...(parsed.agents || {}),
+        claude: { ...DEFAULT_RUNTIME.agents.claude, ...((parsed.agents || {}).claude || {}) },
+      },
+    };
+  } catch (e) {
+    log(`runtime config unavailable/invalid; using safe defaults (${e.message})`);
+    return DEFAULT_RUNTIME;
+  }
+}
+const RUNTIME = loadRuntimeConfig();
+const CLAUDE_RUNTIME = { ...RUNTIME.defaults, ...(RUNTIME.agents.claude || {}) };
+const RECENT_TURNS = Math.max(1, Math.min(50, Number(CLAUDE_RUNTIME.recent_turns) || 10));
+const SUMMARY_DAYS = Math.max(0, Math.min(30, Number(CLAUDE_RUNTIME.summary_days) || 1));
+
 const RECALL_DAYS_MAX = 365; // "recall N" upper bound, so a typo can't pull years
 
 function log(msg) {
@@ -347,11 +377,14 @@ const CLAUDE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max per task
 // stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
 function claudeRaw(task, extraArgs) {
   return new Promise((resolve) => {
-    const args = ['-p', task, '--model', 'claude-opus-4-6',
+    const args = ['-p', task,
+                  '--model', String(CLAUDE_RUNTIME.model),
                   '--output-format', 'json',
                   '--dangerously-skip-permissions',
-                  '--mcp-config', EMPTY_MCP, '--strict-mcp-config',
-                  ...extraArgs];
+                  '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
+    if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
+    if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
+    args.push(...extraArgs);
     // Build the full cmd.exe command line ourselves and pass it verbatim,
     // so Node's spawn doesn't re-escape paths that already contain spaces.
     const cmdLine = ['claude', ...args.map(quoteForCmd)].join(' ');
@@ -580,10 +613,9 @@ function buildRecallContext(days) {
 async function buildRestoreContext() {
   const parts = [];
   const all = loadDailySummaries();
-  const pastDates = Object.keys(all).sort();
-  if (pastDates.length) {
-    const last = pastDates[pastDates.length - 1];
-    parts.push(`[Summary of our previous conversation day (${last})]\n${all[last]}`);
+  const pastDates = Object.keys(all).sort().slice(-SUMMARY_DAYS);
+  for (const day of pastDates) {
+    parts.push(`[Summary of our previous conversation day (${day})]\n${all[day]}`);
   }
   const turns = readDayTurns(state.day);
   if (turns.length > RECENT_TURNS) {
@@ -615,6 +647,9 @@ async function handleMessage(rawText, msgId) {
   }
 
   let result, ok, code, forked, actualId;
+  // A daemon restart or expiry clears the pinned session. Restore archive context
+  // before the fresh first turn instead of waiting for Claude to fail visibly.
+  if (!contextPrefix && !state.sessionId) contextPrefix = await buildRestoreContext();
   try {
     ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { contextPrefix }));
   } finally {
@@ -737,7 +772,26 @@ async function hermesQueuePoll() {
     writeHermesQueue({ ...q, status: 'working', updated: new Date().toISOString() });
     busy = true;
     try {
-      const { ok, text: result } = await runClaude(q.task);
+      // Queue tasks need archive recovery too; a queue call otherwise bypasses
+      // Claude's Telegram handler and would arrive without conversation context.
+      await rolloverIfNewDay();
+      let contextPrefix = await buildRestoreContext();
+      let { ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix });
+      if (!ok && result === '__SESSION_EXPIRED__') {
+        contextPrefix = await buildRestoreContext();
+        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix }));
+      }
+      if (ok && forked) {
+        contextPrefix = await buildRestoreContext();
+        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix }));
+      }
+      if (ok) {
+        let replyForArchive = String(result || '').trim();
+        if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) {
+          replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
+        }
+        appendArchive({ day: state.day, ts: new Date().toISOString(), source: 'hermes_queue', user: q.task, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
+      }
       writeHermesQueue({ ...q, status: ok ? 'done' : 'error', [ok ? 'result' : 'error']: result, updated: new Date().toISOString() });
       log(`hermes-queue: task ${q.id} ${ok ? 'done' : 'error'}`);
     } catch (e) {

@@ -7,6 +7,7 @@ jira.json
 # Public users: drop your own private context here; it is gitignored.
 CLAUDE.local.md
 .claude/settings.local.json
+agent-runtime.json
 
 # Runtime state files
 .telegram-state.json

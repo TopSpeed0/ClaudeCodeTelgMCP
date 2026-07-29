@@ -6,7 +6,9 @@ This workspace provides a ready-to-use Claude Code setup with a Telegram bot bri
 
 This repo ships **only** the Telegram bridge — it is intentionally lean. Domain knowledge lives in your **installed skills** (`~/.claude/skills` plus built-ins): look up the relevant skill for the task instead of expecting it documented here. When the task daemon spawns a session, every user-level skill is available regardless of which folder the daemon runs from, so a generic launch still "knows" all your tooling.
 
-**Private / local context:** if a `CLAUDE.local.md` file exists in this folder, read it first — it holds personal or internal instructions that are intentionally **not** committed (`CLAUDE.local.md` and `.claude/settings.local.json` are gitignored). Public users are free to drop their own custom instructions into `CLAUDE.local.md`; they will be picked up by Claude but never pushed to the public repo.
+**Private / local context:** if a `CLAUDE.local.md` file exists in this folder, read it first — it holds personal or internal instructions that are intentionally **not** committed (`CLAUDE.local.md` and `.claude/settings.local.json` are gitignored). Public users are free to drop their own private context here; Claude will pick it up but it will never be pushed to Git.
+
+**Context recovery before limitation:** before saying prior context, a skill, or project knowledge is missing, inspect the injected archive context and applicable installed skills. If that is insufficient, search the local `archive/` summaries/current-day turns and relevant `SKILL.md` files before asking the user to repeat information or declaring that the context is unavailable.
 
 ## Components
 

@@ -113,6 +113,14 @@ Runs independently, long-polling Telegram for messages. Each message becomes a `
 - Chunks long output to fit Telegram's 4096-char message limit
 - Strips ANSI codes for clean monospace display
 
+### Runtime model and context policy
+
+Copy `agent-runtime.example.json` to the local, gitignored `agent-runtime.json` before starting the daemon. It controls Claude model selection, fallback model, reasoning effort, recent-turn window, and summary depth; restart the daemon after changing it.
+
+The shared catalog includes the currently known Copilot-hosted Opus, Sonnet, and OpenAI/GPT model identifiers, with `gpt-5.6-terra` as the global default for Copilot. Claude Code uses the Claude-specific `agents.claude.model` entry because it cannot natively execute an OpenAI/Copilot model identifier. The initial Claude selection is `claude-opus-5` with `claude-opus-4.6` as a fallback; choose only model identifiers accepted by the installed Claude Code CLI.
+
+Direct Telegram messages and `.claude-queue.json` tasks now both perform daily rollover, use archive recovery, and append successful turns to the same archive. That prevents the queue worker from becoming a context-less second agent.
+
 ### Anti-Double-Send Pattern
 When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-via-tg]` to stdout. The daemon detects this sentinel and skips its own relay — so the user sees the message exactly once.
 
