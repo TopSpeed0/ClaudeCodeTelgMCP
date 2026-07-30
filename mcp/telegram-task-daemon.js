@@ -16,7 +16,8 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
+const { routeTelegramCommand } = require('./telegram-command-router');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -57,6 +58,7 @@ function loadRuntimeConfig() {
 }
 const RUNTIME = loadRuntimeConfig();
 const CLAUDE_RUNTIME = { ...RUNTIME.defaults, ...(RUNTIME.agents.claude || {}) };
+const DAEMON_STARTED_AT = new Date();
 const RECENT_TURNS = Math.max(1, Math.min(50, Number(CLAUDE_RUNTIME.recent_turns) || 10));
 const SUMMARY_DAYS = Math.max(0, Math.min(30, Number(CLAUDE_RUNTIME.summary_days) || 1));
 
@@ -614,12 +616,14 @@ function buildRecallContext(days) {
 // yesterday's summary + a summary of earlier-today + the last RECENT_TURNS verbatim.
 async function buildRestoreContext() {
   const parts = [];
-  const all = loadDailySummaries();
+  // /clear creates a hard context boundary without deleting the audit archive.
+  const cutoff = state.contextResetAt ? Date.parse(state.contextResetAt) : null;
+  const all = cutoff ? {} : loadDailySummaries();
   const pastDates = Object.keys(all).sort().slice(-SUMMARY_DAYS);
   for (const day of pastDates) {
     parts.push(`[Summary of our previous conversation day (${day})]\n${all[day]}`);
   }
-  const turns = readDayTurns(state.day);
+  const turns = readDayTurns(state.day).filter(turn => !cutoff || Date.parse(turn.ts || 0) > cutoff);
   if (turns.length > RECENT_TURNS) {
     const sum = await summarize("earlier part of today's conversation", turnsToText(turns.slice(0, turns.length - RECENT_TURNS)));
     if (sum) parts.push(`[Summary of earlier today]\n${sum}`);
@@ -630,14 +634,6 @@ async function buildRestoreContext() {
   return `[Context restore — the previous session could not be resumed; here is our conversation so far so you can continue seamlessly]\n\n${parts.join('\n\n')}`;
 }
 
-function connectorSummary() {
-  try {
-    const registry = JSON.parse(fs.readFileSync(path.join(WORKDIR, 'mcp-connectors.json'), 'utf-8'));
-    const enabled = Object.entries(registry.servers || {}).filter(([, value]) => value && value.enabled).map(([name]) => name);
-    return enabled.length ? enabled.join(', ') : 'none enabled';
-  } catch (_) { return 'registry unavailable'; }
-}
-
 function installedSkillNames() {
   const home = process.env.USERPROFILE || process.env.HOME;
   const dir = path.join(home, '.claude', 'skills');
@@ -645,27 +641,97 @@ function installedSkillNames() {
   catch (_) { return []; }
 }
 
-function telegramCommand(rawText) {
-  const [command] = String(rawText || '').trim().split(/\s+/, 1);
-  if (!command.startsWith('/')) return null;
-  if (command === '/help') return '<b>Telegram commands</b>\n/status — daemon, configured model, MCPs\n/model — configured model\n/mcp — enabled connector registry\n/skills — installed skills\n/clear — clear the Telegram Claude session\n/help — this list\n\nOther text, including a skill slash-command, is sent to Claude as a task.';
-  if (command === '/status') return `<b>Claude Telegram daemon</b>\nModel: <code>${CLAUDE_RUNTIME.model}</code>\nFallback: <code>${CLAUDE_RUNTIME.fallback_model || 'none'}</code>\nSession: <code>${state.sessionId || 'fresh'}</code>\nMCP connectors: <code>${connectorSummary()}</code>`;
-  if (command === '/model') return `<b>Configured model</b>: <code>${CLAUDE_RUNTIME.model}</code>\nThis is the daemon runtime setting; Telegram cannot inspect a transient CLI UI model switch.`;
-  if (command === '/mcp') return `<b>Enabled MCP connectors</b>: <code>${connectorSummary()}</code>`;
-  if (command === '/skills') {
-    const names = installedSkillNames();
-    return names.length ? `<b>Installed skills (${names.length})</b>\n<code>${names.join('\n')}</code>` : 'No installed skills found.';
+function daemonBuild() {
+  try { return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: WORKDIR, encoding: 'utf8', timeout: 2000 }).trim(); }
+  catch (_) { return 'unknown'; }
+}
+
+function formatUptime(seconds) {
+  const total = Math.floor(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+function configuredModels() {
+  const names = Object.keys(RUNTIME.models || {}).sort();
+  return names.length ? names : [String(CLAUDE_RUNTIME.model)];
+}
+
+function persistModelSelection(requested) {
+  const model = configuredModels().find(name => name.toLowerCase() === requested.toLowerCase());
+  if (!model) return null;
+  const runtime = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_FILE, 'utf8'));
+  runtime.agents = { ...(runtime.agents || {}) };
+  runtime.agents.claude = { ...(runtime.agents.claude || {}), model };
+  const temporary = `${RUNTIME_CONFIG_FILE}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(runtime, null, 2) + '\n');
+  fs.renameSync(temporary, RUNTIME_CONFIG_FILE);
+  CLAUDE_RUNTIME.model = model;
+  RUNTIME.agents.claude.model = model;
+  state.sessionId = null;
+  state.lastActivity = null;
+  saveState();
+  return model;
+}
+
+function mcpReadiness() {
+  try {
+    const registry = JSON.parse(fs.readFileSync(path.join(WORKDIR, 'mcp-connectors.json'), 'utf8'));
+    const enabled = Object.entries(registry.servers || {}).filter(([, server]) => server && server.enabled);
+    let generated = {};
+    try { generated = JSON.parse(fs.readFileSync(EMPTY_MCP, 'utf8')).mcpServers || {}; }
+    catch (_) { /* reported per connector below */ }
+    const details = enabled.map(([name, server]) => {
+      const ready = Object.prototype.hasOwnProperty.call(generated, name);
+      return `<code>${htmlEscape(name)}</code> — ${ready ? 'configured, on-demand' : 'ERROR: not generated'} (${htmlEscape(server.transport || 'unknown')})`;
+    });
+    return { summary: enabled.length ? `${details.filter(line => !line.includes('ERROR')).length}/${enabled.length} configured` : 'none enabled', details };
+  } catch (error) {
+    return { summary: 'registry error', details: [`Registry error: ${htmlEscape(error.message)}`] };
   }
-  if (command === '/clear') {
-    state.sessionId = null; state.lastActivity = null; saveState();
-    return 'Claude Telegram session cleared. The next task starts fresh; archive files are retained.';
-  }
-  return null;
+}
+
+async function telegramCommand(rawText) {
+  const mcp = () => mcpReadiness();
+  return routeTelegramCommand(rawText, {
+    skillNames: installedSkillNames(),
+    handlers: {
+      help: () => '<b>Claude Telegram commands</b>\n/status — live daemon state\n/model [name] — show or select an allowed model\n/mcp — configured connector readiness\n/skills — installed skills\n/clear — clear session and injected conversation context\n/help — this list\n\nOnly installed skill slash commands are forwarded as tasks. Unknown slash commands are rejected locally.',
+      status: () => {
+        const readiness = mcp();
+        return `<b>Claude Telegram daemon</b>\nHealth: <code>running</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nSession: <code>${htmlEscape(state.sessionId || 'fresh')}</code>\nMCP: <code>${readiness.summary}</code>`;
+      },
+      model: (argument) => {
+        if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
+        const selected = persistModelSelection(argument);
+        return selected
+          ? `Claude daemon model changed to <code>${htmlEscape(selected)}</code>. The next task starts with a fresh session.`
+          : `Model <code>${htmlEscape(argument)}</code> is not in the local allow-list. Use <code>/model</code>.`;
+      },
+      mcp: () => {
+        const readiness = mcp();
+        return `<b>Claude MCP connectors</b>\n${readiness.details.length ? readiness.details.join('\n') : 'No enabled connectors.'}\n\nConfigured connectors start on demand for an agent task; this command does not run infrastructure probes.`;
+      },
+      skills: () => {
+        const names = installedSkillNames();
+        return names.length ? `<b>Installed skills (${names.length})</b>\n<code>${names.map(htmlEscape).join('\n')}</code>` : 'No installed skills found.';
+      },
+      clear: () => {
+        state.sessionId = null;
+        state.lastActivity = null;
+        state.contextResetAt = new Date().toISOString();
+        saveState();
+        return 'Claude session and injected context cleared. Archive files are retained, but pre-clear turns and summaries will not be injected into future tasks.';
+      },
+    },
+  });
 }
 
 async function handleMessage(rawText, msgId) {
-  const commandReply = telegramCommand(rawText);
-  if (commandReply !== null) { await sendChunked(commandReply, { mode: 'rich' }); return; }
+  const command = await telegramCommand(rawText);
+  if (command.handled) { await sendChunked(command.reply, { mode: 'rich' }); return; }
   await rolloverIfNewDay();
   const stopTyping = startTyping();
   const t0 = Date.now();
