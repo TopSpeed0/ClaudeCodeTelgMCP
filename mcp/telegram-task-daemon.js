@@ -630,7 +630,42 @@ async function buildRestoreContext() {
   return `[Context restore — the previous session could not be resumed; here is our conversation so far so you can continue seamlessly]\n\n${parts.join('\n\n')}`;
 }
 
+function connectorSummary() {
+  try {
+    const registry = JSON.parse(fs.readFileSync(path.join(WORKDIR, 'mcp-connectors.json'), 'utf-8'));
+    const enabled = Object.entries(registry.servers || {}).filter(([, value]) => value && value.enabled).map(([name]) => name);
+    return enabled.length ? enabled.join(', ') : 'none enabled';
+  } catch (_) { return 'registry unavailable'; }
+}
+
+function installedSkillNames() {
+  const home = process.env.USERPROFILE || process.env.HOME;
+  const dir = path.join(home, '.claude', 'skills');
+  try { return fs.readdirSync(dir).filter(name => fs.existsSync(path.join(dir, name, 'SKILL.md'))).sort(); }
+  catch (_) { return []; }
+}
+
+function telegramCommand(rawText) {
+  const [command] = String(rawText || '').trim().split(/\s+/, 1);
+  if (!command.startsWith('/')) return null;
+  if (command === '/help') return '<b>Telegram commands</b>\n/status — daemon, configured model, MCPs\n/model — configured model\n/mcp — enabled connector registry\n/skills — installed skills\n/clear — clear the Telegram Claude session\n/help — this list\n\nOther text, including a skill slash-command, is sent to Claude as a task.';
+  if (command === '/status') return `<b>Claude Telegram daemon</b>\nModel: <code>${CLAUDE_RUNTIME.model}</code>\nFallback: <code>${CLAUDE_RUNTIME.fallback_model || 'none'}</code>\nSession: <code>${state.sessionId || 'fresh'}</code>\nMCP connectors: <code>${connectorSummary()}</code>`;
+  if (command === '/model') return `<b>Configured model</b>: <code>${CLAUDE_RUNTIME.model}</code>\nThis is the daemon runtime setting; Telegram cannot inspect a transient CLI UI model switch.`;
+  if (command === '/mcp') return `<b>Enabled MCP connectors</b>: <code>${connectorSummary()}</code>`;
+  if (command === '/skills') {
+    const names = installedSkillNames();
+    return names.length ? `<b>Installed skills (${names.length})</b>\n<code>${names.join('\n')}</code>` : 'No installed skills found.';
+  }
+  if (command === '/clear') {
+    state.sessionId = null; state.lastActivity = null; saveState();
+    return 'Claude Telegram session cleared. The next task starts fresh; archive files are retained.';
+  }
+  return null;
+}
+
 async function handleMessage(rawText, msgId) {
+  const commandReply = telegramCommand(rawText);
+  if (commandReply !== null) { await sendChunked(commandReply, { mode: 'rich' }); return; }
   await rolloverIfNewDay();
   const stopTyping = startTyping();
   const t0 = Date.now();
