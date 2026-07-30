@@ -372,6 +372,12 @@ function quoteForCmd(arg) {
 }
 
 const CLAUDE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max per task
+// On Windows, invoking the npm-installed `claude.cmd` routes through cmd.exe and
+// inherits its ~8K command-line limit. Resolve the real native executable so
+// prompts with skills/archive context use CreateProcess directly instead.
+const CLAUDE_EXECUTABLE = process.platform === 'win32' && process.env.APPDATA
+  ? path.join(process.env.APPDATA, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe')
+  : 'claude';
 
 // Low-level spawn of `claude -p` with the given extra args. Pure: collects
 // stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
@@ -385,13 +391,9 @@ function claudeRaw(task, extraArgs) {
     if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
     if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
     args.push(...extraArgs);
-    // Build the full cmd.exe command line ourselves and pass it verbatim,
-    // so Node's spawn doesn't re-escape paths that already contain spaces.
-    const cmdLine = ['claude', ...args.map(quoteForCmd)].join(' ');
-    log(`spawn: ${cmdLine}`);
-    const proc = spawn(process.env.COMSPEC || 'cmd.exe',
-      ['/d', '/s', '/c', cmdLine],
-      { cwd: WORKDIR, windowsVerbatimArguments: true, env: { ...process.env } });
+    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} prompt_chars=${task.length}`);
+    const proc = spawn(CLAUDE_EXECUTABLE, args,
+      { cwd: WORKDIR, env: { ...process.env } });
     let out = '', errOut = '', killed = false;
     proc.stdout.on('data', (d) => out += d.toString());
     proc.stderr.on('data', (d) => errOut += d.toString());
