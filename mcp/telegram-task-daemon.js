@@ -18,6 +18,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 const { TELEGRAM_COMMANDS, routeTelegramCommand } = require('./telegram-command-router');
+const { resolveQueueModel } = require('./queue-model');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -386,17 +387,17 @@ const CLAUDE_EXECUTABLE = process.platform === 'win32' && process.env.APPDATA
 
 // Low-level spawn of `claude -p` with the given extra args. Pure: collects
 // stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
-function claudeRaw(task, extraArgs) {
+function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
   return new Promise((resolve) => {
     const args = ['-p', task,
-                  '--model', String(CLAUDE_RUNTIME.model),
+                  '--model', String(model),
                   '--output-format', 'json',
                   '--dangerously-skip-permissions',
                   '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
     if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
     if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
     args.push(...extraArgs);
-    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} prompt_chars=${task.length}`);
+    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}`);
     const proc = spawn(CLAUDE_EXECUTABLE, args,
       { cwd: WORKDIR, env: { ...process.env } });
     let out = '', errOut = '', killed = false;
@@ -434,16 +435,16 @@ async function summarize(label, body) {
 // Run a Telegram task through Claude with our session management. Optional
 // contextPrefix is prepended (used to restore conversation context on a fork
 // or for an explicit recall). Returns { ok, text, code, forked, actualId }.
-async function runClaude(task, { contextPrefix } = {}) {
-  const resuming = !!state.sessionId;
+async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false } = {}) {
+  const resuming = !isolated && !!state.sessionId;
   // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
   // fresh session and assign it via --session-id.
-  const sessionId = state.sessionId || crypto.randomUUID();
+  const sessionId = isolated ? crypto.randomUUID() : (state.sessionId || crypto.randomUUID());
   const prompt = contextPrefix ? `${contextPrefix}\n\n---\nThe user's actual message:\n${task}` : task;
   const sessionArgs = resuming ? ['--resume', sessionId] : ['--session-id', sessionId];
   log(resuming ? `resuming session ${sessionId}` : `starting fresh session ${sessionId}`);
 
-  const { code, out, errOut, killed } = await claudeRaw(prompt, sessionArgs);
+  const { code, out, errOut, killed } = await claudeRaw(prompt, sessionArgs, { model });
   if (killed) {
     return { ok: false, text: `Task timed out after ${CLAUDE_TIMEOUT_MS / 1000}s. Partial output:\n${out.trim() || '(none)'}`, code: -1 };
   }
@@ -465,22 +466,24 @@ async function runClaude(task, { contextPrefix } = {}) {
     return { ok: false, text: '__SESSION_EXPIRED__' };
   }
 
-  // Follow the session Claude actually used.
+  // An isolated queue task must never inherit or overwrite the Telegram session.
   let forked = false;
-  if (code === 0 && actualId) {
-    if (!state.sessionId) {
-      state.sessionId = actualId; saveState();
-      log(`pinned session ${actualId}`);
-    } else if (resuming && actualId !== sessionId) {
-      log(`SILENT FORK: asked to resume ${sessionId}, Claude used ${actualId} — re-pinning (context likely lost)`);
-      state.sessionId = actualId; saveState();
-      forked = true;
+  if (!isolated) {
+    if (code === 0 && actualId) {
+      if (!state.sessionId) {
+        state.sessionId = actualId; saveState();
+        log(`pinned session ${actualId}`);
+      } else if (resuming && actualId !== sessionId) {
+        log(`SILENT FORK: asked to resume ${sessionId}, Claude used ${actualId} — re-pinning (context likely lost)`);
+        state.sessionId = actualId; saveState();
+        forked = true;
+      }
+    } else if (code === 0 && !state.sessionId && !actualId) {
+      state.sessionId = sessionId; saveState();
+      log(`pinned session ${sessionId} (no json envelope)`);
     }
-  } else if (code === 0 && !state.sessionId && !actualId) {
-    state.sessionId = sessionId; saveState();
-    log(`pinned session ${sessionId} (no json envelope)`);
+    if (code === 0) { state.lastActivity = new Date().toISOString(); saveState(); }
   }
-  if (code === 0) { state.lastActivity = new Date().toISOString(); saveState(); }
 
   const text = answer.trim() || (errOut.trim() ? `(stderr) ${errOut.trim()}` : `(no output, exit=${code})`);
   return { ok: code === 0, text, code, forked, actualId };
@@ -890,22 +893,23 @@ async function hermesQueuePoll() {
       // Queue tasks need archive recovery too; a queue call otherwise bypasses
       // Claude's Telegram handler and would arrive without conversation context.
       await rolloverIfNewDay();
+      const model = resolveQueueModel(q.model, configuredModels(), CLAUDE_RUNTIME.model);
       let contextPrefix = await buildRestoreContext();
-      let { ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix });
+      let { ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix, model, isolated: true });
       if (!ok && result === '__SESSION_EXPIRED__') {
         contextPrefix = await buildRestoreContext();
-        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix }));
+        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix, model, isolated: true }));
       }
       if (ok && forked) {
         contextPrefix = await buildRestoreContext();
-        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix }));
+        ({ ok, text: result, code, forked, actualId } = await runClaude(q.task, { contextPrefix, model, isolated: true }));
       }
       if (ok) {
         let replyForArchive = String(result || '').trim();
         if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) {
           replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
         }
-        appendArchive({ day: state.day, ts: new Date().toISOString(), source: 'hermes_queue', user: q.task, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
+        appendArchive({ day: state.day, ts: new Date().toISOString(), source: 'hermes_queue', model, user: q.task, assistant: replyForArchive, sessionId: actualId, forked: !!forked });
       }
       writeHermesQueue({ ...q, status: ok ? 'done' : 'error', [ok ? 'result' : 'error']: result, updated: new Date().toISOString() });
       log(`hermes-queue: task ${q.id} ${ok ? 'done' : 'error'}`);
