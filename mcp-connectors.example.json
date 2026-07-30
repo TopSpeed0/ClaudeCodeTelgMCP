@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "host": "replace-with-the-mcp-host-identifier",
+  "servers": {
+    "example-readonly-server": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "python",
+      "args": ["path/to/server.py"],
+      "env": {},
+      "tools": ["example_list_resources"]
+    }
+  }
+}

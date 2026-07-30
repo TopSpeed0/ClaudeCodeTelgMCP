@@ -21,7 +21,7 @@ const { spawn } = require('child_process');
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
 const LOCK_FILE = path.join(WORKDIR, '.telegram-task-daemon.lock');
-const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.json');
+const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.local.json');
 
 // ---------- Conversation archive / memory ----------
 // Continuity lives in OUR files, not Claude's fragile session resume. Every turn

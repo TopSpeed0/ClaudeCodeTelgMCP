@@ -78,6 +78,10 @@ if (-not $tg.TELEGRAM_BOT_TOKEN -or -not $tg.TELEGRAM_CHAT_ID) {
 $env:TELEGRAM_BOT_TOKEN = $tg.TELEGRAM_BOT_TOKEN
 $env:TELEGRAM_CHAT_ID   = $tg.TELEGRAM_CHAT_ID
 
+# Generate the daemon MCP config from this repo's private connector registry.
+& node (Join-Path $PSScriptRoot 'sync-mcp-connectors.js') claude
+if ($LASTEXITCODE -ne 0) { throw "MCP connector sync failed" }
+
 Write-Host "Starting task daemon (chat_id=$($tg.TELEGRAM_CHAT_ID))"
 Write-Host "Workspace: $repo"
 

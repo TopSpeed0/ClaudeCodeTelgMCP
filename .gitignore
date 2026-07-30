@@ -1,6 +1,8 @@
 # Credentials — NEVER commit these
 .telegram-config
 .mcp.json
+mcp-connectors.json
+mcp/daemon-mcp.local.json
 jira.json
 
 # Personal / local instructions — read by Claude but never committed.
