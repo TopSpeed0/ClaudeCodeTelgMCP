@@ -1,6 +1,14 @@
 'use strict';
 
 const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear']);
+const TELEGRAM_COMMANDS = [
+  { command: 'status', description: 'Daemon status and runtime' },
+  { command: 'model', description: 'Show or select an allowed model' },
+  { command: 'mcp', description: 'Configured MCP connectors' },
+  { command: 'skills', description: 'Installed skills' },
+  { command: 'clear', description: 'Start a fresh conversation context' },
+  { command: 'help', description: 'Show supported Telegram commands' },
+];
 
 function parseTelegramCommand(rawText) {
   const text = String(rawText || '').trim();
@@ -28,4 +36,4 @@ async function routeTelegramCommand(rawText, { skillNames = [], handlers = {} } 
   return { handled: true, reply: `Unknown Telegram command: /${command}\nUse /help for supported commands.` };
 }
 
-module.exports = { LOCAL_COMMANDS, parseTelegramCommand, routeTelegramCommand };
+module.exports = { LOCAL_COMMANDS, TELEGRAM_COMMANDS, parseTelegramCommand, routeTelegramCommand };

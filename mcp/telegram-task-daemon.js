@@ -17,7 +17,7 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
-const { routeTelegramCommand } = require('./telegram-command-router');
+const { TELEGRAM_COMMANDS, routeTelegramCommand } = require('./telegram-command-router');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -332,6 +332,9 @@ async function sendChunked(text, { mode = 'rich' } = {}) {
     let body, parse_mode;
     if (effectiveMode === 'mono') {
       body = `<pre>${htmlEscape(chunk)}</pre>`;
+      parse_mode = 'HTML';
+    } else if (effectiveMode === 'html') {
+      body = chunk;
       parse_mode = 'HTML';
     } else if (effectiveMode === 'rich') {
       body = markdownToTelegramHTML(chunk);
@@ -698,10 +701,10 @@ async function telegramCommand(rawText) {
   return routeTelegramCommand(rawText, {
     skillNames: installedSkillNames(),
     handlers: {
-      help: () => '<b>Claude Telegram commands</b>\n/status — live daemon state\n/model [name] — show or select an allowed model\n/mcp — configured connector readiness\n/skills — installed skills\n/clear — clear session and injected conversation context\n/help — this list\n\nOnly installed skill slash commands are forwarded as tasks. Unknown slash commands are rejected locally.',
+      help: () => '<b>📋 Claude Bot Commands</b>\n\n/status — daemon and runtime\n/model [name] — current model or switch allowed model\n/mcp — configured MCP connectors\n/skills — installed skills\n/clear — fresh session and conversation context\n/help — this list\n\nType <code>/</code> to see this menu. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
       status: () => {
         const readiness = mcp();
-        return `<b>Claude Telegram daemon</b>\nHealth: <code>running</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nSession: <code>${htmlEscape(state.sessionId || 'fresh')}</code>\nMCP: <code>${readiness.summary}</code>`;
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -729,9 +732,18 @@ async function telegramCommand(rawText) {
   });
 }
 
+async function registerTelegramCommandMenu() {
+  try {
+    await tgApi('setMyCommands', { commands: TELEGRAM_COMMANDS });
+    log(`registered Telegram command menu (${TELEGRAM_COMMANDS.length} commands)`);
+  } catch (error) {
+    log(`setMyCommands failed: ${error.message}`);
+  }
+}
+
 async function handleMessage(rawText, msgId) {
   const command = await telegramCommand(rawText);
-  if (command.handled) { await sendChunked(command.reply, { mode: 'rich' }); return; }
+  if (command.handled) { await sendChunked(command.reply, { mode: 'html' }); return; }
   await rolloverIfNewDay();
   const stopTyping = startTyping();
   const t0 = Date.now();
@@ -906,5 +918,6 @@ async function hermesQueuePoll() {
 }
 
 acquireLock();
+registerTelegramCommandMenu();
 pollLoop().catch((e) => { log(`fatal: ${e.stack || e.message}`); releaseLock(); process.exit(1); });
 hermesQueuePoll();
