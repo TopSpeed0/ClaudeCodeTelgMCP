@@ -37,7 +37,7 @@ const RUNTIME_CONFIG_FILE = path.join(WORKDIR, 'agent-runtime.json');
 // the supported shape; edits apply on the next daemon restart.
 const DEFAULT_RUNTIME = {
   defaults: { model: 'gpt-5.6-terra', reasoning_effort: 'high', recent_turns: 10, summary_days: 1 },
-  agents: { claude: { model: 'claude-opus-5', fallback_model: 'claude-opus-4.6' } },
+  agents: { claude: { model: 'claude-opus-5', fallback_model: 'claude-sonnet-5' } },
 };
 function loadRuntimeConfig() {
   try {
