@@ -378,18 +378,37 @@ function quoteForCmd(arg) {
 }
 
 const CLAUDE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes max per task
-// On Windows, invoking the npm-installed `claude.cmd` routes through cmd.exe and
-// inherits its ~8K command-line limit. Resolve the real native executable so
-// prompts with skills/archive context use CreateProcess directly instead.
-const CLAUDE_EXECUTABLE = process.platform === 'win32' && process.env.APPDATA
-  ? path.join(process.env.APPDATA, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe')
-  : 'claude';
+// On Windows, invoking `claude.cmd` routes through cmd.exe and inherits its
+// ~8K command-line limit. Prefer the native executable from the current
+// installer, while retaining compatibility with the legacy npm installation.
+function resolveClaudeExecutable() {
+  if (process.platform !== 'win32') return 'claude';
+
+  const candidates = [
+    process.env.CLAUDE_EXECUTABLE,
+    process.env.USERPROFILE && path.join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe'),
+    process.env.APPDATA && path.join(process.env.APPDATA, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
+  ];
+  return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || 'claude';
+}
+
+const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
+
+// Keep the prompt argument comfortably below Windows' CreateProcess command-line
+// limit. Large prompts (archive rollover / restored context) are sent through
+// stdin instead; Claude Code's print mode supports a prompt argument plus piped
+// input, just like `cat file | claude -p "Review this"`.
+const MAX_PROMPT_ARG_CHARS = 12000;
 
 // Low-level spawn of `claude -p` with the given extra args. Pure: collects
 // stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
 function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
   return new Promise((resolve) => {
-    const args = ['-p', task,
+    const oversized = task.length > MAX_PROMPT_ARG_CHARS;
+    const promptArg = oversized
+      ? 'Process the complete task content supplied on standard input as the user request. Do not omit or reinterpret it.'
+      : task;
+    const args = ['-p', promptArg,
                   '--model', String(model),
                   '--output-format', 'json',
                   '--dangerously-skip-permissions',
@@ -397,13 +416,21 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
     if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
     if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
     args.push(...extraArgs);
-    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}`);
+    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}${oversized ? ' via=stdin' : ''}`);
     const proc = spawn(CLAUDE_EXECUTABLE, args,
-      { cwd: WORKDIR, env: { ...process.env } });
+      { cwd: WORKDIR, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '', errOut = '', killed = false;
     proc.stdout.on('data', (d) => out += d.toString());
     proc.stderr.on('data', (d) => errOut += d.toString());
     proc.on('error', (e) => resolve({ code: -1, out: '', errOut: `spawn error: ${e.message}`, killed: false }));
+    // Close stdin explicitly: without this, Claude may wait for more piped input.
+    // The 'error' listener is required, not defensive: if the child exits before
+    // draining a large piped prompt, the write fails asynchronously with EOF/EPIPE.
+    // An unhandled 'error' on stdin would take down the whole daemon, not just
+    // this task — a sync try/catch cannot intercept it. The child's own exit is
+    // reported by the 'close'/'error' handlers, so swallowing it here is enough.
+    proc.stdin.on('error', (e) => log(`stdin write failed (child likely exited early): ${e.code || e.message}`));
+    try { proc.stdin.end(oversized ? task : undefined); } catch (_) {}
     // Kill runaway tasks so the daemon stays responsive.
     const timer = setTimeout(() => {
       killed = true;
