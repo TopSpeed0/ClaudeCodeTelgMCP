@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { TELEGRAM_COMMANDS, parseTelegramCommand, routeTelegramCommand } = require('../mcp/telegram-command-router');
 
 test('parses local commands, arguments, and bot mentions', () => {
-  assert.deepEqual(parseTelegramCommand('/MODEL claude-opus-5'), { command: 'model', argument: 'claude-opus-5' });
+  assert.deepEqual(parseTelegramCommand('/MODEL claude-opus-5-5'), { command: 'model', argument: 'claude-opus-5-5' });
   assert.deepEqual(parseTelegramCommand('/status@my_bot'), { command: 'status', argument: '' });
   assert.equal(parseTelegramCommand('status'), null);
 });

@@ -37,7 +37,7 @@ const RUNTIME_CONFIG_FILE = path.join(WORKDIR, 'agent-runtime.json');
 // the supported shape; edits apply on the next daemon restart.
 const DEFAULT_RUNTIME = {
   defaults: { model: 'gpt-5.6-terra', reasoning_effort: 'high', recent_turns: 10, summary_days: 1 },
-  agents: { claude: { model: 'claude-opus-5', fallback_model: 'claude-sonnet-5' } },
+  agents: { claude: { model: 'claude-opus-5-5', fallback_model: 'claude-sonnet-5' } },
 };
 function loadRuntimeConfig() {
   try {
@@ -469,6 +469,8 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   const sessionId = isolated ? crypto.randomUUID() : (state.sessionId || crypto.randomUUID());
   const prompt = contextPrefix ? `${contextPrefix}\n\n---\nThe user's actual message:\n${task}` : task;
   const sessionArgs = resuming ? ['--resume', sessionId] : ['--session-id', sessionId];
+  // Opt-in Claude in Chrome tools for task sessions (not summaries); needs the extension connected.
+  if (CLAUDE_RUNTIME.chrome === true) sessionArgs.push('--chrome');
   log(resuming ? `resuming session ${sessionId}` : `starting fresh session ${sessionId}`);
 
   const { code, out, errOut, killed } = await claudeRaw(prompt, sessionArgs, { model });
