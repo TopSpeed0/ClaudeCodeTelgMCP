@@ -117,7 +117,7 @@ Runs independently, long-polling Telegram for messages. Each message becomes a `
 - Queues messages that arrive while a task runs and runs them in order; the queue survives a daemon restart
 - Shows live progress: one silent status message (elapsed time, step count, the last three tool steps), updated in place and deleted when the task ends (`telegram.progress` in `agent-runtime.json`)
 - Accepts photos and files: they are saved under `inbox/<day>/` (gitignored) and handed to Claude to read
-- Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) once it is installed (`pip install faster-whisper`; settings under `telegram.voice`)
+- Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) once it is installed (`pip install faster-whisper`; settings under `telegram.voice`, e.g. `"model": "large-v3-turbo"`). Audio is decoded with ffmpeg when available. Notes that mix languages (e.g. English and Hebrew) are re-transcribed per segment so each part stays in its own language instead of being translated; that path takes about four times longer
 - Collapses long code blocks into tap-to-expand quotes; answers longer than two messages arrive as the first part plus the full text as a file
 - Shows 🟢 Online / 🔴 Offline in the bot's profile, with a "checked" time refreshed every 10 minutes
 - Gates risky actions: daemon sessions load a PreToolUse hook (`mcp/telegram-approval-hook.js`) that holds sending mail, cluster writes, deletes, pushes and API writes until you tap ✅ / ❌ (no answer in 10 minutes = denied; rules and switch under `approval`)
