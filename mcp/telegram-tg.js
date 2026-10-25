@@ -183,8 +183,21 @@ function pickFileMethod(filePath) {
   return { method: 'sendDocument', field: 'document' };
 }
 
+// Set by the task daemon: the Telegram message this Claude task answers. The
+// first tg_send to the operator chat is threaded under it, and tg_react
+// defaults to it until a newer message arrives.
+const DAEMON_REPLY_TO = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
+let pendingReplyTo = DAEMON_REPLY_TO;
+
 // Tracks the most recent inbound message id so tg_react can default to it.
-let lastReceivedMessageId = null;
+let lastReceivedMessageId = DAEMON_REPLY_TO;
+
+// Handshake with telegram-task-daemon.js: while tg_ask waits it owns getUpdates
+// and the daemon pauses; see telegram-handshake.js.
+const { setAskFlag, takeHandoff, forwardToDaemon } = require('./telegram-handshake');
+const { isImmediateCommand } = require('./telegram-command-router');
+
+process.on('exit', () => setAskFlag(false));
 
 // ---------- Tool implementations ----------
 // Accepted parse_mode values per Telegram Bot API.
@@ -231,6 +244,9 @@ async function tgSend(text, parseMode, opts = {}) {
   stopTypingKeeper();
   const chatId = opts.chat_id || config.chat_id;
   const pm = normalizeParseMode(parseMode);
+  const replyTo = pendingReplyTo != null && String(chatId) === String(config.chat_id) && opts.thread_id == null
+    ? { message_id: pendingReplyTo, allow_sending_without_reply: true }
+    : undefined;
 
   // File attachment path: pick method by extension and multipart-upload.
   if (opts.file_path) {
@@ -239,7 +255,9 @@ async function tgSend(text, parseMode, opts = {}) {
     if (opts.thread_id != null) fields.message_thread_id = opts.thread_id;
     if (text) fields.caption = text;
     if (pm) fields.parse_mode = pm;
+    if (replyTo) fields.reply_parameters = JSON.stringify(replyTo);
     const msg = await tgApiMultipart(method, fields, field, opts.file_path, { httpTimeoutMs: 120000 });
+    if (replyTo) pendingReplyTo = null;
     return `Sent file via ${method} (message_id=${msg.message_id}).`;
   }
 
@@ -250,8 +268,36 @@ async function tgSend(text, parseMode, opts = {}) {
   };
   if (opts.thread_id != null) payload.message_thread_id = opts.thread_id;
   if (pm) payload.parse_mode = pm;
-  const msg = await tgApi('sendMessage', payload);
+  if (replyTo) payload.reply_parameters = replyTo;
+  let msg;
+  try {
+    msg = await tgApi('sendMessage', payload);
+  } catch (e) {
+    if (!/too long/i.test(e.message)) throw e;
+    return sendAsPage(text, pm, chatId, opts, replyTo);
+  }
+  if (replyTo) pendingReplyTo = null;
   return `Sent (message_id=${msg.message_id}${pm ? `, parse_mode=${pm}` : ''}).`;
+}
+
+// Over Telegram's 4096-character limit: deliver the whole answer as an .html
+// page (opens rendered on the phone) instead of failing or cutting it.
+async function sendAsPage(text, pm, chatId, opts, replyTo) {
+  // Telegram HTML is a subset of HTML, so it renders as is; newlines stay line breaks.
+  const body = `<div style="white-space:pre-wrap">${pm === 'HTML' ? text : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+  const file = path.join(require('os').tmpdir(), `claude-answer-${Date.now()}.html`);
+  fs.writeFileSync(file, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
+    + `<body style="font-family:system-ui,sans-serif;line-height:1.5;padding:12px;max-width:900px;margin:auto">${body}</body>`);
+  try {
+    const fields = { chat_id: chatId, caption: `📄 Full answer (${text.length.toLocaleString('en-US')} chars, too long for one message)` };
+    if (opts.thread_id != null) fields.message_thread_id = opts.thread_id;
+    if (replyTo) fields.reply_parameters = JSON.stringify(replyTo);
+    const msg = await tgApiMultipart('sendDocument', fields, 'document', file, { httpTimeoutMs: 120000 });
+    if (replyTo) pendingReplyTo = null;
+    return `Text was over Telegram's 4096-char limit, so it was sent as an HTML page (message_id=${msg.message_id}). Next time keep messages shorter or put details in <blockquote expandable>.`;
+  } finally {
+    try { fs.unlinkSync(file); } catch (_) {}
+  }
 }
 
 // Edit a previously sent message in place — progress updates without chat spam.
@@ -303,7 +349,13 @@ async function tgTyping(seconds, action) {
   return `Sent ${pulses} "${act}" pulse${pulses === 1 ? '' : 's'} over ${total}s.`;
 }
 
-async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
+async function tgAsk(...args) {
+  setAskFlag(true);
+  try { return await tgAskWait(...args); }
+  finally { setAskFlag(false); }
+}
+
+async function tgAskWait(question, timeoutSeconds, parseMode, opts = {}) {
   const timeoutMs = Math.max(5, Math.min(36000, Number(timeoutSeconds) || 300)) * 1000;
   const pm = normalizeParseMode(parseMode);
   const silent = !question || !question.trim();
@@ -315,6 +367,7 @@ async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
   // so discards messages that arrived in the gap between polls. The persisted
   // updateOffset already prevents re-consuming old messages.
   if (!silent) {
+    takeHandoff(); // a leftover from an earlier ask is not this question's answer
     try {
       const drain = await tgApi('getUpdates', { offset: -1, timeout: 0 }, { httpTimeoutMs: 5000 });
       if (drain.length) {
@@ -353,7 +406,16 @@ async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
   const allowedUpdates = choices ? ['message', 'callback_query'] : ['message'];
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const remainingSec = Math.max(1, Math.min(50, Math.floor((deadline - Date.now()) / 1000)));
+    // The task daemon may have caught the reply in the second before it paused.
+    const handoff = takeHandoff();
+    if (handoff && handoff.text && isImmediateCommand(handoff.text)) forwardToDaemon(handoff);
+    else if (handoff && (!handoff.date || handoff.date * 1000 >= sentDate * 1000 - 5000)) {
+      lastReceivedMessageId = handoff.message_id;
+      startTypingKeeper(chatId);
+      return handoff.text || '(non-text message)';
+    }
+    // Short polls, so a handed-over reply is picked up within seconds.
+    const remainingSec = Math.max(1, Math.min(10, Math.floor((deadline - Date.now()) / 1000)));
     let updates;
     try {
       updates = await tgApi('getUpdates', {
@@ -385,6 +447,8 @@ async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
       if (!m) continue;
       if (String(m.chat.id) !== String(chatId)) continue;
       if (m.date && m.date * 1000 < sentDate * 1000 - 5000) continue;
+      // /stop, /status, /queue … are for the daemon, not an answer to this question.
+      if (m.text && isImmediateCommand(m.text)) { forwardToDaemon(m); continue; }
       lastReceivedMessageId = m.message_id;
       const text = m.text || m.caption || '(non-text message)';
       // Auto-start a sustained typing indicator the instant a message is caught.
@@ -399,7 +463,7 @@ async function tgAsk(question, timeoutSeconds, parseMode, opts = {}) {
 const PARSE_MODE_SCHEMA = {
   type: 'string',
   enum: ['HTML', 'MarkdownV2', 'Markdown'],
-  description: 'Optional Telegram parse mode. Omit for plain text (default). Recommended: "HTML" — escape <, >, & in dynamic content and use <b>bold</b>, <i>italic</i>, <code>mono</code>, <pre>block</pre>, <a href="url">link</a>. "MarkdownV2" requires escaping many chars (_*[]()~`>#+-=|{}.!) and is more error-prone. Avoid Markdown literals like **bold** without setting parse_mode — they render as literal asterisks.',
+  description: 'Optional Telegram parse mode. Omit for plain text (default). Recommended: "HTML" — escape <, >, & in dynamic content and use <b>bold</b>, <i>italic</i>, <code>mono</code>, <pre>block</pre>, <a href="url">link</a>, <blockquote>quote</blockquote>, <tg-spoiler>hidden</tg-spoiler>. Put long details (logs, full lists, command output) in <blockquote expandable>…</blockquote>: it shows a few lines and expands on tap; <pre> and <code> work inside it. Messages are capped at 4096 characters; longer text is delivered as an HTML page attachment. "MarkdownV2" requires escaping many chars (_*[]()~`>#+-=|{}.!) and is more error-prone. Avoid Markdown literals like **bold** without setting parse_mode — they render as literal asterisks.',
 };
 
 const TOOLS = [

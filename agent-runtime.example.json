@@ -20,5 +20,14 @@
       "reasoning_effort": "high",
       "chrome": false
     }
+  },
+  "telegram": {
+    "progress": true,
+    "voice": { "model": "small", "language": "" }
+  },
+  "approval": {
+    "enabled": true,
+    "timeout_seconds": 600,
+    "extra_patterns": []
   }
 }

@@ -112,6 +112,22 @@ Runs independently, long-polling Telegram for messages. Each message becomes a `
 - Suppresses duplicate output when the agent already sent via `tg_send` (sentinel: `[sent-via-tg]`)
 - Chunks long output to fit Telegram's 4096-char message limit
 - Strips ANSI codes for clean monospace display
+- Threads each answer under your message (including the agent's first `tg_send`)
+- Reacts on your message: ✍ queued · 👀 working · 🎉 done · 💔 failed (cleared when stopped)
+- Queues messages that arrive while a task runs and runs them in order; the queue survives a daemon restart
+- Shows live progress: one silent status message (elapsed time, step count, the last three tool steps), updated in place and deleted when the task ends (`telegram.progress` in `agent-runtime.json`)
+- Accepts photos and files: they are saved under `inbox/<day>/` (gitignored) and handed to Claude to read
+- Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) once it is installed (`pip install faster-whisper`; settings under `telegram.voice`)
+- Collapses long code blocks into tap-to-expand quotes; answers longer than two messages arrive as the first part plus the full text as a file
+- Shows 🟢 Online / 🔴 Offline in the bot's profile, with a "checked" time refreshed every 10 minutes
+- Gates risky actions: daemon sessions load a PreToolUse hook (`mcp/telegram-approval-hook.js`) that holds sending mail, cluster writes, deletes, pushes and API writes until you tap ✅ / ❌ (no answer in 10 minutes = denied; rules and switch under `approval`)
+
+Telegram commands (published to the bot's `/` menu at startup):
+- **Answered at once, even mid-task:** `/status`, `/stop` (`/stop all` also empties the queue and stops side tasks, `/stop bg` side tasks only), `/queue`, `/usage` (cost, turns, tokens and time for the last task and today), `/bg <task>` (side task in its own session, in parallel), `/mcp`, `/skills`, `/help`
+- **Run in turn with tasks:** `/plan <task>` (read-only run: looks and proposes, changes nothing), `/retry` (re-run your last message), `/new` or `/clear`, `/model [name]`
+- Installed skill names work as commands too; they are forwarded to Claude as tasks.
+
+While `tg_ask` or the approval hook waits for your reply it owns Telegram polling (`mcp/telegram-handshake.js`): it writes `.telegram-ask.active`, the daemon pauses, a reply the daemon caught just before pausing is handed over through `.telegram-ask-handoff.json`, and messages meant for the daemon (`/stop`, new tasks) go back through `.telegram-daemon-inbox.json`.
 
 ### Runtime model and context policy
 

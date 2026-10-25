@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+// telegram-approval-hook.js — Claude Code PreToolUse hook for daemon-spawned
+// sessions. Those run with --dangerously-skip-permissions, so this hook is
+// the only gate: a tool call that matches a risky rule (sending mail, cluster
+// writes, deletes, pushes, API writes) waits for ✅ / ❌ on Telegram.
+// Anything else passes through untouched (no output, exit 0).
+//
+// The daemon wires it in through `--settings` (see writeDaemonSettings in
+// telegram-task-daemon.js). Interactive Claude sessions never load it.
+// Fail closed: no answer, or Telegram unreachable, means deny.
+//
+// Rules: DEFAULT_RULES below, plus `approval.extra_patterns` (regex strings)
+// in agent-runtime.json; `approval.enabled: false` turns the gate off and
+// `approval.timeout_seconds` (default 600) sets how long to wait.
+
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const crypto = require('crypto');
+const handshake = require('./telegram-handshake');
+
+const ROOT = path.resolve(__dirname, '..');
+
+// [label, regex tested against the command text (shell tools) or tool name + input (MCP tools)]
+const DEFAULT_RULES = [
+  ['send mail or invite', /\b(Send-OutlookMail|Send-OutlookReply|New-OutlookAppointment|Set-OutlookMeetingResponse)\b[^\n]*\s-Send\b/i],
+  ['cluster write', /\b(oc|kubectl)(\.exe)?\s+(apply|create|delete|patch|replace|scale|edit|label|annotate|rollout|adm|exec|drain|cordon|set)\b/i],
+  ['git history write', /\bgit\s+(push|reset\s+--hard|clean\s+-\w*f|branch\s+-D|rebase)\b/i],
+  ['recursive delete', /\brm\s+-\w*(rf|fr)\w*\b|\bRemove-Item\b[^\n]*-Recurse|\brmdir\s+\/s\b|\brd\s+\/s\b/i],
+  ['PowerShell remove', /\bRemove-(?!Variable\b|Module\b|Job\b|PSDrive\b|TypeData\b|Event\b)[A-Z]\w+/i],
+  ['storage destructive', /\b(volume|vol|lun|snapmirror|vserver|aggr|aggregate|qtree|snapshot|igroup|export-policy)\b[^\n]*\b(delete|destroy|offline|break|restrict|remove)\b/i],
+  ['account change', /\b(Disable|Enable|Unlock|Set)-ADAccount\w*|\bSet-ADAccountPassword\b|\bReset-\w*Password\b/i],
+  ['stop or restart', /\b(Stop-Computer|Restart-Computer|Stop-Service|Restart-Service|Stop-VM|Restart-VM)\b|\bshutdown(\.exe)?\s+\/[rsp]\b|\bsystemctl\s+(stop|restart|disable)\b|\breboot\b/i],
+  ['API write', /\b(Invoke-RestMethod|Invoke-WebRequest|irm|iwr)\b[^\n]*-Method\s+['"]?(Post|Put|Patch|Delete)\b|\bcurl(\.exe)?\b[^\n]*(-X\s*|--request\s+)['"]?(POST|PUT|PATCH|DELETE)\b/i],
+];
+// MCP tools whose name says they change something. Telegram's own tools are exempt.
+const MCP_WRITE_TOOL = /^mcp__(?!telegram-tg__).*__\w*(create|delete|update|send|post|apply|remove|edit|write|transition|add|set|approve|reject)\w*$/i;
+
+function loadRuntime() {
+  try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'agent-runtime.json'), 'utf-8')).approval || {}; }
+  catch (_) { return {}; }
+}
+
+function loadConfig() {
+  const token = process.env.TELEGRAM_BOT_TOKEN, chat = process.env.TELEGRAM_CHAT_ID;
+  if (token && chat && !token.startsWith('YOUR_')) return { bot_token: token, chat_id: chat };
+  return JSON.parse(fs.readFileSync(path.join(ROOT, '.telegram-config'), 'utf-8'));
+}
+
+// Returns { label, text } when the call needs approval, else null.
+function classify(toolName, input, extraPatterns) {
+  const rules = [...DEFAULT_RULES, ...extraPatterns.map(p => [`custom: ${p}`, new RegExp(p, 'i')])];
+  if (/^(Bash|PowerShell)$/.test(toolName)) {
+    const text = String((input && input.command) || '');
+    const hit = rules.find(([, re]) => re.test(text));
+    return hit ? { label: hit[0], text } : null;
+  }
+  if (toolName.startsWith('mcp__')) {
+    const text = `${toolName} ${JSON.stringify(input || {})}`;
+    if (MCP_WRITE_TOOL.test(toolName)) return { label: 'MCP write tool', text };
+    const hit = rules.find(([, re]) => re.test(text));
+    return hit ? { label: hit[0], text } : null;
+  }
+  return null;
+}
+
+function htmlEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function decide(decision, reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision, permissionDecisionReason: reason },
+  }));
+  process.exit(0);
+}
+
+const YES = /^\s*(y|yes|ok|allow|approve|approved|go|כן)\s*[.!]?\s*$/i;
+const NO = /^\s*(n|no|deny|denied|reject|stop|cancel|לא)\s*[.!]?\s*$/i;
+
+async function main() {
+  let raw = '';
+  for await (const chunk of process.stdin) raw += chunk;
+  const event = JSON.parse(raw || '{}');
+  const settings = loadRuntime();
+  if (settings.enabled === false) return process.exit(0);
+  const match = classify(String(event.tool_name || ''), event.tool_input, Array.isArray(settings.extra_patterns) ? settings.extra_patterns : []);
+  if (!match) return process.exit(0);
+
+  const timeoutMs = Math.max(30, Math.min(3600, Number(settings.timeout_seconds) || 600)) * 1000;
+  let config;
+  try { config = loadConfig(); } catch (e) { return decide('deny', `Approval needed (${match.label}) but Telegram is not configured: ${e.message}`); }
+
+  const api = (method, params, httpTimeoutMs = 20000) => new Promise((resolve, reject) => {
+    const body = JSON.stringify(params);
+    const req = https.request({
+      hostname: 'api.telegram.org', port: 443, path: `/bot${config.bot_token}/${method}`, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c);
+      res.on('end', () => { try { const p = JSON.parse(data); p.ok ? resolve(p.result) : reject(new Error(`${method}: ${p.description}`)); } catch (e) { reject(e); } });
+    });
+    req.on('error', reject);
+    req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`${method} timeout`)));
+    req.end(body);
+  });
+
+  const nonce = crypto.randomBytes(4).toString('hex');
+  const replyTo = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
+  const shown = match.text.length > 1500 ? `${match.text.slice(0, 1500)}…` : match.text;
+  const question = `🛡 <b>Approval needed</b> — ${htmlEscape(match.label)}\n<b>Tool:</b> <code>${htmlEscape(event.tool_name)}</code>\n<pre>${htmlEscape(shown)}</pre>\n`
+    + `<i>Waiting ${Math.round(timeoutMs / 60000)} min, then denied. You can also reply yes / no.</i>`;
+
+  handshake.setAskFlag(true);
+  process.on('exit', () => handshake.setAskFlag(false));
+  let sent;
+  try {
+    sent = await api('sendMessage', {
+      chat_id: config.chat_id, text: question, parse_mode: 'HTML',
+      reply_parameters: replyTo ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
+      reply_markup: { inline_keyboard: [[{ text: '✅ Allow', callback_data: `ap:y:${nonce}` }, { text: '❌ Deny', callback_data: `ap:n:${nonce}` }]] },
+    });
+  } catch (e) {
+    return decide('deny', `Approval needed (${match.label}) but the Telegram request failed: ${e.message}`);
+  }
+
+  const finish = async (allowed, how) => {
+    const verdict = allowed ? '✅ <b>Allowed</b>' : '❌ <b>Denied</b>';
+    await api('editMessageText', {
+      chat_id: config.chat_id, message_id: sent.message_id, parse_mode: 'HTML',
+      text: `${verdict} — ${htmlEscape(match.label)}\n<pre>${htmlEscape(shown)}</pre>\n<i>${htmlEscape(how)}</i>`,
+    }).catch(() => {});
+    return decide(allowed ? 'allow' : 'deny', allowed ? `Operator approved on Telegram (${how}).` : `Operator denied this on Telegram (${how}). Do not retry it; tell the user what was blocked.`);
+  };
+
+  // Start after everything the daemon already confirmed, so no update is skipped.
+  let offset = 0;
+  try { offset = JSON.parse(fs.readFileSync(path.join(ROOT, '.telegram-task-state.json'), 'utf-8')).updateOffset || 0; } catch (_) {}
+  const textAnswer = (text) => (YES.test(text) ? true : NO.test(text) ? false : null);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const handoff = handshake.takeHandoff();
+    if (handoff && handoff.text) {
+      const answer = textAnswer(handoff.text);
+      if (answer != null) return finish(answer, `reply "${handoff.text.trim()}"`);
+      handshake.forwardToDaemon(handoff);
+    }
+    let updates = [];
+    try {
+      updates = await api('getUpdates', { offset, timeout: 10, allowed_updates: ['message', 'callback_query'] }, 20000);
+    } catch (_) { await new Promise(r => setTimeout(r, 2000)); continue; }
+    for (const u of updates) {
+      offset = u.update_id + 1;
+      if (u.callback_query) {
+        const cq = u.callback_query;
+        const [tag, verdict, id] = String(cq.data || '').split(':');
+        if (tag === 'ap' && id === nonce) {
+          await api('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
+          return finish(verdict === 'y', 'button');
+        }
+        continue; // someone else's buttons (an old tg_ask); not ours to answer
+      }
+      const m = u.message;
+      if (!m || String(m.chat.id) !== String(config.chat_id)) continue;
+      const answer = m.text ? textAnswer(m.text) : null;
+      if (answer != null) return finish(answer, `reply "${m.text.trim()}"`);
+      // /stop, /status, new tasks, photos: the daemon's business. /stop kills
+      // this whole process tree, which ends the wait as a deny.
+      handshake.forwardToDaemon(m);
+    }
+  }
+  return finish(false, `no answer within ${Math.round(timeoutMs / 60000)} min`);
+}
+
+if (require.main === module) main().catch((e) => decide('deny', `Approval hook error: ${e.message}`));
+
+module.exports = { classify };

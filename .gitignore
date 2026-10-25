@@ -15,6 +15,13 @@ agent-runtime.json
 .telegram-state.json
 .telegram-task-state.json
 .telegram-task-daemon.lock
+.telegram-ask.active
+.telegram-ask-handoff.json
+.telegram-daemon-inbox.json
+mcp/daemon-settings.local.json
+
+# Photos, files and voice notes received on Telegram
+inbox/
 
 # Conversation archive (personal chat history + per-day summaries)
 archive/

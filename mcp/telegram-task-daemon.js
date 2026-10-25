@@ -17,8 +17,9 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
-const { TELEGRAM_COMMANDS, routeTelegramCommand } = require('./telegram-command-router');
+const { TELEGRAM_COMMANDS, parseTelegramCommand, isImmediateCommand, routeTelegramCommand } = require('./telegram-command-router');
 const { resolveQueueModel } = require('./queue-model');
+const handshake = require('./telegram-handshake');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -59,6 +60,8 @@ function loadRuntimeConfig() {
 }
 const RUNTIME = loadRuntimeConfig();
 const CLAUDE_RUNTIME = { ...RUNTIME.defaults, ...(RUNTIME.agents.claude || {}) };
+// Bridge behaviour: { progress: bool, voice: { model, language, python } }.
+const TELEGRAM_RUNTIME = RUNTIME.telegram || {};
 const DAEMON_STARTED_AT = new Date();
 const RECENT_TURNS = Math.max(1, Math.min(50, Number(CLAUDE_RUNTIME.recent_turns) || 10));
 const SUMMARY_DAYS = Math.max(0, Math.min(30, Number(CLAUDE_RUNTIME.summary_days) || 1));
@@ -84,7 +87,7 @@ function loadConfig() {
 
 const config = loadConfig();
 
-let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null };
+let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null, queue: [], lastTask: null, usage: null };
 try {
   const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
   // Migrate old sessionStarted boolean → sessionId
@@ -247,7 +250,7 @@ function htmlEscape(s) {
 // rich formatting instead of an ugly <pre> monospace block.
 //
 // Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists.
-// Out of scope: tables, links, images, blockquotes.
+// Out of scope: tables, links, images, Markdown blockquotes.
 function markdownToTelegramHTML(text) {
   // Stash fenced code blocks first so their contents are immune to subsequent
   // bold/italic/header rewrites. We replace them back at the very end.
@@ -290,10 +293,12 @@ function markdownToTelegramHTML(text) {
     return `<code>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code>`;
   });
 
-  // Restore fenced code blocks as <pre>...</pre>.
+  // Restore fenced code blocks as <pre>...</pre>; long ones (over 12 lines)
+  // collapse into a tap-to-expand quote so the answer stays readable.
   html = html.replace(/\u0000CB(\d+)\u0000/g, (_m, i) => {
     const body = codeBlocks[Number(i)];
-    return `<pre>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`;
+    const pre = `<pre>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`;
+    return body.split('\n').length > 12 ? `<blockquote expandable>${pre}</blockquote>` : pre;
   });
 
   return html.trim();
@@ -313,10 +318,19 @@ function looksTabular(text) {
   return false;
 }
 
-async function sendChunked(text, { mode = 'rich' } = {}) {
+// replyTo threads the first chunk under the user's message; the rest follow it.
+async function sendChunked(text, { mode = 'rich', replyTo } = {}) {
   // Telegram caps messages at 4096 chars. We leave headroom for the <pre>...</pre> wrapper.
   const MAX = 3800;
   let remaining = stripAnsi(text || '(no output)');
+  const threadUnder = replyTo;
+  let attachFull = null;
+  if (remaining.length > MAX * 2) {
+    attachFull = remaining;
+    const head = remaining.slice(0, MAX - 200);
+    const cutAt = head.lastIndexOf('\n\n') > MAX / 2 ? head.lastIndexOf('\n\n') : head.lastIndexOf('\n');
+    remaining = `${head.slice(0, cutAt > MAX / 2 ? cutAt : head.length)}\n\n… continued in the attached file.`;
+  }
 
   // In 'rich' mode, fall back to monospace if the payload looks like a table —
   // alignment matters more than formatting for CLI output.
@@ -345,11 +359,14 @@ async function sendChunked(text, { mode = 'rich' } = {}) {
       parse_mode = undefined;
     }
 
+    // allow_sending_without_reply: a deleted original must not block the answer.
+    const reply_parameters = replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined;
     try {
       await tgApi('sendMessage', {
         chat_id: config.chat_id,
         text: body,
         parse_mode,
+        reply_parameters,
         disable_web_page_preview: true,
       });
     } catch (e) {
@@ -359,10 +376,20 @@ async function sendChunked(text, { mode = 'rich' } = {}) {
       await tgApi('sendMessage', {
         chat_id: config.chat_id,
         text: chunk,
+        reply_parameters,
         disable_web_page_preview: true,
       });
     }
+    replyTo = undefined;
     remaining = remaining.slice(chunk.length);
+  }
+  if (attachFull) {
+    const file = path.join(require('os').tmpdir(), `claude-answer-${Date.now()}.md`);
+    try {
+      fs.writeFileSync(file, attachFull);
+      await tgSendFile(file, `📄 Full answer (${attachFull.length.toLocaleString('en-US')} chars)`, threadUnder);
+    } catch (e) { log(`full answer file: ${e.message}`); }
+    finally { try { fs.unlinkSync(file); } catch (_) {} }
   }
 }
 
@@ -400,9 +427,56 @@ const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
 // input, just like `cat file | claude -p "Review this"`.
 const MAX_PROMPT_ARG_CHARS = 12000;
 
+// On Windows, killing only the direct child can leave claude.exe children
+// (MCP servers, tools) running as orphans; taskkill /T takes the whole tree.
+function killTree(proc) {
+  if (process.platform === 'win32') {
+    try { execFileSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { timeout: 5000, stdio: 'ignore' }); } catch (_) {}
+  } else {
+    try { proc.kill('SIGTERM'); } catch (_) {}
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000);
+  }
+}
+
+// Task-session Claude processes, so /stop can end them. Summaries are not tracked.
+let activeTask = null;      // the main conversation (and Hermes queue tasks): { proc, stopped }
+const bgTasks = new Map();  // /bg side tasks by Telegram message id: { proc, stopped, text, startedAt }
+function stopHandle(handle, why) {
+  handle.stopped = true;
+  log(`${why}: killing claude PID=${handle.proc.pid}`);
+  killTree(handle.proc);
+}
+function stopActiveTask() {
+  if (!activeTask) return false;
+  stopHandle(activeTask, '/stop');
+  return true;
+}
+
+// Daemon-only Claude settings: the Telegram approval gate (PreToolUse hook).
+// Written at startup because the hook needs this checkout's absolute path.
+const DAEMON_SETTINGS = path.join(__dirname, 'daemon-settings.local.json');
+function writeDaemonSettings() {
+  const hook = path.join(__dirname, 'telegram-approval-hook.js').replace(/\\/g, '/');
+  const settings = {
+    hooks: {
+      PreToolUse: [{
+        matcher: 'Bash|PowerShell|mcp__.*',
+        hooks: [{ type: 'command', command: `node --use-system-ca "${hook}"`, timeout: 3700 }],
+      }],
+    },
+  };
+  fs.writeFileSync(DAEMON_SETTINGS, JSON.stringify(settings, null, 2));
+}
+
 // Low-level spawn of `claude -p` with the given extra args. Pure: collects
-// stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed }.
-function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
+// stdout/stderr and performs NO state mutation. Resolves { code, out, errOut, killed, stopped }.
+//   onSpawn(handle)  registers the process as a /stop target.
+//   replyTo          the Telegram message this task answers; telegram-tg.js threads
+//                    its first tg_send under it and the approval hook its question.
+//   permissionMode   e.g. 'plan' (read-only) instead of skipping permission checks.
+//   onEvent(ev)      live progress: switches to stream-json; `out` is still the
+//                    final result envelope, the same shape as --output-format json.
+function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, replyTo, permissionMode, onEvent } = {}) {
   return new Promise((resolve) => {
     const oversized = task.length > MAX_PROMPT_ARG_CHARS;
     const promptArg = oversized
@@ -410,19 +484,41 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
       : task;
     const args = ['-p', promptArg,
                   '--model', String(model),
-                  '--output-format', 'json',
-                  '--dangerously-skip-permissions',
-                  '--mcp-config', EMPTY_MCP, '--strict-mcp-config'];
+                  '--output-format', onEvent ? 'stream-json' : 'json',
+                  '--mcp-config', EMPTY_MCP, '--strict-mcp-config',
+                  '--settings', DAEMON_SETTINGS];
+    if (onEvent) args.push('--verbose'); // stream-json in print mode requires it
+    // Bypass would override plan mode, so a read-only run must not skip checks.
+    if (permissionMode) args.push('--permission-mode', permissionMode);
+    else args.push('--dangerously-skip-permissions');
     if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
     if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
     args.push(...extraArgs);
-    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}${oversized ? ' via=stdin' : ''}`);
+    log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}${oversized ? ' via=stdin' : ''}${permissionMode ? ` mode=${permissionMode}` : ''}`);
+    const env = { ...process.env };
+    delete env.TELEGRAM_REPLY_TO_MESSAGE_ID;
+    if (replyTo != null) env.TELEGRAM_REPLY_TO_MESSAGE_ID = String(replyTo);
     const proc = spawn(CLAUDE_EXECUTABLE, args,
-      { cwd: WORKDIR, env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+      { cwd: WORKDIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const handle = { proc, stopped: false };
+    if (onSpawn) onSpawn(handle);
     let out = '', errOut = '', killed = false;
-    proc.stdout.on('data', (d) => out += d.toString());
+    // stream-json: one event per line; keep the final result event as `out`.
+    let lineBuf = '', resultEvent = null, strayText = '';
+    const takeLine = (line) => {
+      if (!line.trim()) return;
+      let ev; try { ev = JSON.parse(line); } catch (_) { strayText += `${line}\n`; return; }
+      if (ev.type === 'result') resultEvent = ev;
+      else { try { onEvent(ev); } catch (e) { log(`progress: ${e.message}`); } }
+    };
+    proc.stdout.on('data', (d) => {
+      if (!onEvent) { out += d.toString(); return; }
+      lineBuf += d.toString();
+      let nl;
+      while ((nl = lineBuf.indexOf('\n')) >= 0) { takeLine(lineBuf.slice(0, nl)); lineBuf = lineBuf.slice(nl + 1); }
+    });
     proc.stderr.on('data', (d) => errOut += d.toString());
-    proc.on('error', (e) => resolve({ code: -1, out: '', errOut: `spawn error: ${e.message}`, killed: false }));
+    proc.on('error', (e) => resolve({ code: -1, out: '', errOut: `spawn error: ${e.message}`, killed: false, stopped: false }));
     // Close stdin explicitly: without this, Claude may wait for more piped input.
     // The 'error' listener is required, not defensive: if the child exits before
     // draining a large piped prompt, the write fails asynchronously with EOF/EPIPE.
@@ -435,16 +531,16 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model } = {}) {
     const timer = setTimeout(() => {
       killed = true;
       log(`timeout: killing claude after ${CLAUDE_TIMEOUT_MS / 1000}s`);
-      // On Windows, proc is cmd.exe — killing it leaves claude.exe running as an orphan.
-      // taskkill /F /T kills the entire process tree (cmd.exe + claude.exe children).
-      if (process.platform === 'win32') {
-        try { require('child_process').execSync(`taskkill /F /T /PID ${proc.pid}`, { timeout: 5000 }); } catch (_) {}
-      } else {
-        try { proc.kill('SIGTERM'); } catch (_) {}
-        setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 5000);
-      }
+      killTree(proc);
     }, CLAUDE_TIMEOUT_MS);
-    proc.on('close', (code) => { clearTimeout(timer); resolve({ code, out, errOut, killed }); });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (onEvent) {
+        takeLine(lineBuf);
+        out = resultEvent ? JSON.stringify(resultEvent) : strayText;
+      }
+      resolve({ code, out, errOut, killed, stopped: handle.stopped });
+    });
   });
 }
 
@@ -459,10 +555,54 @@ async function summarize(label, body) {
   return env && typeof env.result === 'string' ? env.result.trim() : null;
 }
 
+// /usage bookkeeping from the `--output-format json` envelope: the last task
+// plus a per-day total that resets at the first task of a new local day.
+// total_cost_usd is Claude's own figure (API-equivalent on a subscription).
+function recordUsage(envelope, model, source) {
+  const u = envelope.usage || {};
+  const last = {
+    ts: new Date().toISOString(), source, model,
+    costUsd: Number(envelope.total_cost_usd) || 0,
+    turns: Number(envelope.num_turns) || 0,
+    durationMs: Number(envelope.duration_ms) || 0,
+    inputTokens: (Number(u.input_tokens) || 0) + (Number(u.cache_creation_input_tokens) || 0),
+    cachedTokens: Number(u.cache_read_input_tokens) || 0,
+    outputTokens: Number(u.output_tokens) || 0,
+  };
+  const day = localDayKey();
+  const prev = state.usage && state.usage.day === day ? state.usage : { day, tasks: 0, costUsd: 0, turns: 0, durationMs: 0 };
+  state.usage = {
+    day,
+    tasks: prev.tasks + 1,
+    costUsd: prev.costUsd + last.costUsd,
+    turns: prev.turns + last.turns,
+    durationMs: prev.durationMs + last.durationMs,
+    last,
+  };
+  saveState();
+}
+
+function formatUsage() {
+  const usage = state.usage;
+  if (!usage || !usage.last) return 'No tasks recorded yet.';
+  const n = (v) => Number(v || 0).toLocaleString('en-US');
+  const usd = (v) => `$${Number(v || 0).toFixed(2)}`;
+  const last = usage.last;
+  const today = usage.day === localDayKey()
+    ? `Tasks: <code>${usage.tasks}</code> · Cost: <code>${usd(usage.costUsd)}</code>\nTurns: <code>${usage.turns}</code> · Time: <code>${formatUptime(usage.durationMs / 1000)}</code>`
+    : 'No tasks yet today.';
+  return `<b>💸 Usage</b>\n\n<b>Last task</b> (${htmlEscape(last.source)}, <code>${htmlEscape(last.model)}</code>)\n`
+    + `Cost: <code>${usd(last.costUsd)}</code> · Turns: <code>${last.turns}</code> · Time: <code>${formatUptime(last.durationMs / 1000)}</code>\n`
+    + `Tokens: <code>${n(last.inputTokens)}</code> in · <code>${n(last.cachedTokens)}</code> cached · <code>${n(last.outputTokens)}</code> out\n\n`
+    + `<b>Today</b>\n${today}\n\n<i>Cost is Claude's API-equivalent figure.</i>`;
+}
+
 // Run a Telegram task through Claude with our session management. Optional
 // contextPrefix is prepended (used to restore conversation context on a fork
 // or for an explicit recall). Returns { ok, text, code, forked, actualId }.
-async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false } = {}) {
+// source labels /usage; permissionMode and onEvent pass through to claudeRaw.
+// onSpawn defaults to registering the main /stop target.
+async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false, replyTo, permissionMode, onEvent, onSpawn, source } = {}) {
   const resuming = !isolated && !!state.sessionId;
   // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
   // fresh session and assign it via --session-id.
@@ -473,7 +613,11 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   if (CLAUDE_RUNTIME.chrome === true) sessionArgs.push('--chrome');
   log(resuming ? `resuming session ${sessionId}` : `starting fresh session ${sessionId}`);
 
-  const { code, out, errOut, killed } = await claudeRaw(prompt, sessionArgs, { model });
+  let mainHandle = null;
+  const register = onSpawn || ((handle) => { mainHandle = handle; activeTask = handle; });
+  const { code, out, errOut, killed, stopped } = await claudeRaw(prompt, sessionArgs, { model, onSpawn: register, replyTo, permissionMode, onEvent });
+  if (mainHandle && activeTask === mainHandle) activeTask = null;
+  if (stopped) return { ok: false, text: '__STOPPED__', code: -1 };
   if (killed) {
     return { ok: false, text: `Task timed out after ${CLAUDE_TIMEOUT_MS / 1000}s. Partial output:\n${out.trim() || '(none)'}`, code: -1 };
   }
@@ -485,6 +629,7 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   try { envelope = JSON.parse(out.trim()); } catch (_) {}
   const answer   = (envelope && typeof envelope.result === 'string') ? envelope.result : out.trim();
   const actualId = envelope && envelope.session_id;
+  if (envelope) recordUsage(envelope, model, source || (isolated ? 'queue' : 'telegram'));
 
   // Reset to fresh ONLY when --resume genuinely failed loudly (specific message,
   // not any stray "session"/"resume" word that would wipe context on real failures).
@@ -553,6 +698,12 @@ function tgEdit(messageId, text, { parse_mode } = {}) {
   }).catch(e => log(`edit: ${e.message}`));
 }
 
+function tgClearReaction(messageId) {
+  if (messageId == null) return Promise.resolve();
+  return tgApi('setMessageReaction', { chat_id: config.chat_id, message_id: messageId, reaction: [] })
+    .catch(e => log(`clear reaction: ${e.message}`));
+}
+
 // Pick the right Telegram method + form field based on file extension.
 function pickFileMethod(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -564,7 +715,7 @@ function pickFileMethod(filePath) {
 }
 
 // Multipart upload so the daemon can attach screenshots / logs / reports.
-function tgSendFile(filePath, caption) {
+function tgSendFile(filePath, caption, replyTo) {
   return new Promise((resolve, reject) => {
     let fileBuf;
     try { fileBuf = fs.readFileSync(filePath); }
@@ -574,6 +725,7 @@ function tgSendFile(filePath, caption) {
     const boundary = '----tgBoundary' + Date.now() + Math.random().toString(16).slice(2);
     const fields = { chat_id: config.chat_id };
     if (caption) fields.caption = caption;
+    if (replyTo != null) fields.reply_parameters = JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true });
     const pre = [];
     for (const [k, v] of Object.entries(fields)) {
       pre.push(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`);
@@ -600,6 +752,199 @@ function tgSendFile(filePath, caption) {
     req.setTimeout(120000, () => req.destroy(new Error(`${method} timeout`)));
     req.write(body); req.end();
   });
+}
+
+// ---------- Live status message ----------
+// One status message per task: posted silently at the first tool step (or after
+// a minute), edited in place at most every 3 s, deleted when the task ends.
+// Shows elapsed time, step count and the last three steps.
+const PROGRESS_ENABLED = TELEGRAM_RUNTIME.progress !== false;
+
+function toolLine(name, input) {
+  const i = input || {};
+  const file = (p) => `<code>${htmlEscape(path.basename(String(p || '')))}</code>`;
+  const one = (s, max = 70) => `<code>${htmlEscape(shorten(String(s || '').split('\n')[0], max))}</code>`;
+  if (/^mcp__telegram-tg__/.test(name) || /^(TodoWrite|ToolSearch|ExitPlanMode|EnterPlanMode)$/.test(name)) return null;
+  switch (name) {
+    case 'Bash': case 'PowerShell': return `💻 ${name}: ${one(i.command)}`;
+    case 'Read': return `📖 Read ${file(i.file_path)}`;
+    case 'Write': return `📝 Write ${file(i.file_path)}`;
+    case 'Edit': case 'MultiEdit': case 'NotebookEdit': return `✏️ Edit ${file(i.file_path || i.notebook_path)}`;
+    case 'Grep': return `🔎 Search ${one(i.pattern, 50)}`;
+    case 'Glob': return `🔎 Find ${one(i.pattern, 50)}`;
+    case 'WebFetch': return `🌐 Fetch ${one(i.url, 60)}`;
+    case 'WebSearch': return `🌐 Search ${one(i.query, 60)}`;
+    case 'Agent': case 'Task': return `🤖 Agent: ${htmlEscape(shorten(i.description || '', 60))}`;
+    case 'Skill': return `🧩 Skill ${one(i.skill, 40)}`;
+    default: {
+      if (!name.startsWith('mcp__')) return `⚙️ ${htmlEscape(name)}`;
+      const [, server, tool] = name.split('__');
+      return `🔌 ${htmlEscape(server)}: <code>${htmlEscape(tool || '')}</code>`;
+    }
+  }
+}
+
+function startStatus(replyTo, { title = 'Working' } = {}) {
+  const t0 = Date.now();
+  const steps = [];
+  let count = 0, messageId = null, creating = false, stopped = false, lastSent = '', editTimer = null;
+  const render = () => {
+    const secs = Math.floor((Date.now() - t0) / 1000);
+    const extra = [secs >= 60 ? `${Math.floor(secs / 60)} min` : `${secs} s`];
+    if (count) extra.push(`${count} step${count === 1 ? '' : 's'}`);
+    if (state.queue.length) extra.push(`${state.queue.length} queued`);
+    const lines = [`⏳ <b>${htmlEscape(title)}</b> — ${extra.join(' · ')}`, ...steps];
+    if (handshake.askActive()) lines.push('❓ <i>Waiting for your answer above.</i>');
+    lines.push('<i>/stop to cancel</i>');
+    return lines.join('\n');
+  };
+  const flush = async () => {
+    editTimer = null;
+    if (stopped) return;
+    const text = render();
+    if (text === lastSent) return;
+    try {
+      if (messageId == null) {
+        if (creating) return;
+        creating = true;
+        const sent = await tgApi('sendMessage', {
+          chat_id: config.chat_id, text, parse_mode: 'HTML', disable_notification: true,
+          reply_parameters: replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
+        });
+        messageId = sent.message_id;
+        creating = false;
+        if (stopped) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: messageId }).catch(() => {});
+      } else {
+        await tgEdit(messageId, text, { parse_mode: 'HTML' });
+      }
+      lastSent = text;
+    } catch (e) { creating = false; log(`status: ${e.message}`); }
+  };
+  const schedule = (delayMs) => { if (!editTimer && !stopped) editTimer = setTimeout(flush, delayMs); };
+  const minute = setInterval(() => schedule(0), 60000);
+  return {
+    // A stream-json event from claudeRaw's onEvent.
+    step(ev) {
+      if (!PROGRESS_ENABLED || !ev || ev.type !== 'assistant' || !ev.message || !Array.isArray(ev.message.content)) return;
+      let added = false;
+      for (const c of ev.message.content) {
+        if (!c || c.type !== 'tool_use') continue;
+        const line = toolLine(String(c.name || ''), c.input);
+        if (!line) continue;
+        count++; added = true;
+        steps.push(line);
+        if (steps.length > 3) steps.shift();
+      }
+      if (added) schedule(messageId == null ? 0 : 3000);
+    },
+    stop() {
+      stopped = true;
+      clearInterval(minute);
+      if (editTimer) clearTimeout(editTimer);
+      if (messageId != null) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: messageId }).catch(e => log(`status delete: ${e.message}`));
+    },
+  };
+}
+
+// ---------- Incoming media ----------
+// Photos and files are saved under inbox/<day>/ (gitignored) and handed to
+// Claude as a path to open with Read. Voice notes are transcribed locally
+// with faster-whisper (mcp/stt-faster-whisper.py) when it is installed.
+const INBOX_DIR = path.join(WORKDIR, 'inbox');
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // the Bot API's getFile limit
+const VOICE = TELEGRAM_RUNTIME.voice || {};
+const PYTHON = VOICE.python || (process.platform === 'win32' ? 'python' : 'python3');
+
+function mediaOf(m) {
+  const id = m.message_id;
+  if (Array.isArray(m.photo) && m.photo.length) {
+    const p = m.photo[m.photo.length - 1]; // largest size
+    return { kind: 'photo', file_id: p.file_id, size: p.file_size, name: `${id}.jpg` };
+  }
+  if (m.voice) return { kind: 'voice', file_id: m.voice.file_id, size: m.voice.file_size, name: `${id}.ogg` };
+  if (m.audio) return { kind: 'audio', file_id: m.audio.file_id, size: m.audio.file_size, name: m.audio.file_name || `${id}.mp3` };
+  if (m.video_note) return { kind: 'video', file_id: m.video_note.file_id, size: m.video_note.file_size, name: `${id}.mp4` };
+  if (m.video) return { kind: 'video', file_id: m.video.file_id, size: m.video.file_size, name: m.video.file_name || `${id}.mp4` };
+  if (m.document) return { kind: 'document', file_id: m.document.file_id, size: m.document.file_size, name: m.document.file_name || `${id}.bin` };
+  return null;
+}
+
+function formatBytes(n) {
+  return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+function httpsDownload(urlPath, dest) {
+  return new Promise((resolve, reject) => {
+    const req = https.get({ hostname: 'api.telegram.org', port: 443, path: urlPath }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`download HTTP ${res.statusCode}`)); }
+      const out = fs.createWriteStream(dest);
+      res.pipe(out);
+      out.on('finish', () => out.close(() => resolve(dest)));
+      out.on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error('download timeout')));
+  });
+}
+
+async function downloadMedia(media, msgId) {
+  if (media.size && media.size > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`the file is ${formatBytes(media.size)}; Telegram bots can only download up to 20 MB`);
+  }
+  const file = await tgApi('getFile', { file_id: media.file_id });
+  const dir = path.join(INBOX_DIR, localDayKey());
+  fs.mkdirSync(dir, { recursive: true });
+  const name = String(media.name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 120);
+  const dest = path.join(dir, name.startsWith(String(msgId)) ? name : `${msgId}-${name}`);
+  return httpsDownload(`/file/bot${config.bot_token}/${file.file_path}`, dest);
+}
+
+// Only a positive answer is cached, so installing faster-whisper needs no restart.
+let sttReady = false;
+function sttAvailable() {
+  if (!sttReady) {
+    try { execFileSync(PYTHON, ['-c', 'import faster_whisper'], { stdio: 'ignore', timeout: 60000 }); sttReady = true; }
+    catch (_) { sttReady = false; }
+  }
+  return sttReady;
+}
+
+function transcribe(file) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(__dirname, 'stt-faster-whisper.py');
+    const proc = spawn(PYTHON, [script, file, String(VOICE.model || 'small'), String(VOICE.language || '')], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.on('data', d => err += d.toString());
+    const timer = setTimeout(() => killTree(proc), 5 * 60 * 1000);
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && out.trim()) resolve(out.trim());
+      else reject(new Error(err.trim().split('\n').slice(-2).join(' ') || `transcriber exit ${code}`));
+    });
+  });
+}
+
+// Turns a media queue item into the task text for Claude, or { error } to reply instead.
+async function buildMediaTask(item) {
+  const { media } = item;
+  const caption = item.text || '';
+  const isSpeech = media.kind === 'voice' || (media.kind === 'audio' && !caption);
+  if (isSpeech && !sttAvailable()) {
+    return { error: '🎙 Voice notes need a speech-to-text engine (faster-whisper), which is not installed yet. Type the message instead, or ask me to install voice support.' };
+  }
+  const file = await downloadMedia(media, item.msgId);
+  if (isSpeech) {
+    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }).catch(() => {});
+    const transcript = await transcribe(file);
+    await sendChunked(`🎙 <i>${htmlEscape(transcript)}</i>`, { mode: 'html', replyTo: item.msgId });
+    return { taskText: `${caption ? `${caption}\n\n` : ''}[Voice message from the user, transcribed locally]: ${transcript}` };
+  }
+  const what = { photo: 'a photo', document: 'a file', video: 'a video', audio: 'an audio file' }[media.kind] || 'a file';
+  const ask = caption || `The user sent ${what} without a message. Look at it and respond to what it shows.`;
+  const how = media.kind === 'photo' ? 'Open it with the Read tool to see the image.' : 'Open it with the Read tool (or a suitable command for its type).';
+  return { taskText: `${ask}\n\n[Telegram attachment: ${what} saved at ${file} (${formatBytes(fs.statSync(file).size)}). ${how}]` };
 }
 
 // Sentinel the agent prints to stdout when it has already delivered the answer via tg_send.
@@ -733,10 +1078,18 @@ async function telegramCommand(rawText) {
   return routeTelegramCommand(rawText, {
     skillNames: installedSkillNames(),
     handlers: {
-      help: () => '<b>📋 Claude Bot Commands</b>\n\n/status — daemon and runtime\n/model [name] — current model or switch allowed model\n/mcp — configured MCP connectors\n/skills — installed skills\n/clear — fresh session and conversation context\n/help — this list\n\nType <code>/</code> to see this menu. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
+      help: () => '<b>📋 Claude Bot Commands</b>\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
+        + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
+        + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
+        + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
+        + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
+        + 'Reactions: ✍ queued · 👀 working · 🎉 done · 💔 failed. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
+      queue: () => formatQueue(),
+      usage: () => formatUsage(),
       status: () => {
         const readiness = mcp();
-        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>`;
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nLive progress: <code>${PROGRESS_ENABLED ? 'on' : 'off'}</code>\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -753,6 +1106,7 @@ async function telegramCommand(rawText) {
         const names = installedSkillNames();
         return names.length ? `<b>Installed skills (${names.length})</b>\n<code>${names.map(htmlEscape).join('\n')}</code>` : 'No installed skills found.';
       },
+      stop: (argument) => stopCommand(argument),
       clear: () => {
         state.sessionId = null;
         state.lastActivity = null;
@@ -773,65 +1127,121 @@ async function registerTelegramCommandMenu() {
   }
 }
 
-async function handleMessage(rawText, msgId) {
-  const command = await telegramCommand(rawText);
-  if (command.handled) { await sendChunked(command.reply, { mode: 'html' }); return; }
+function shorten(text, max = 60) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+const PLAN_NOTE = '[Plan mode: this run is read-only. You cannot change anything, and tg_send is unavailable. '
+  + 'Investigate as needed, then give your findings and a concrete step-by-step plan as your final message; '
+  + 'the daemon relays it. The user can reply "go ahead" to carry it out.]\n\n';
+
+// A queue item is { text, msgId, media?, ts }. Commands are recognised from text.
+async function handleMessage(item) {
+  const msgId = item.msgId;
+  let rawText = item.text || '';
+  let permissionMode;
+  const parsed = item.media ? null : parseTelegramCommand(rawText);
+  if (parsed && parsed.command === 'retry') {
+    // /retry re-runs the last task message as if it had just been sent.
+    if (!state.lastTask) { await sendChunked('Nothing to retry yet.', { mode: 'plain', replyTo: msgId }); return; }
+    rawText = state.lastTask;
+    permissionMode = state.lastTaskMode || undefined;
+    await sendChunked(`🔁 <b>Retrying${permissionMode ? ' (plan mode)' : ''}:</b> <i>${htmlEscape(shorten(rawText, 120))}</i>`, { mode: 'html', replyTo: msgId });
+  } else if (parsed && parsed.command === 'plan') {
+    if (!parsed.argument) {
+      await sendChunked('Usage: <code>/plan &lt;task&gt;</code>: a read-only run that looks and proposes, and changes nothing.', { mode: 'html', replyTo: msgId });
+      return;
+    }
+    rawText = parsed.argument;
+    permissionMode = 'plan';
+  } else if (!item.media) {
+    const command = await telegramCommand(rawText);
+    if (command.handled) { await sendChunked(command.reply, { mode: 'html', replyTo: msgId }); return; }
+  }
+  tgReact(msgId, '👀');
+  if (item.media) {
+    let prepared;
+    try { prepared = await buildMediaTask(item); }
+    catch (e) {
+      log(`media: ${e.message}`);
+      await tgReact(msgId, '💔');
+      await sendChunked(`Could not read the attachment: ${htmlEscape(e.message)}`, { mode: 'html', replyTo: msgId });
+      return;
+    }
+    if (prepared.error) {
+      await tgClearReaction(msgId);
+      await sendChunked(prepared.error, { mode: 'html', replyTo: msgId });
+      return;
+    }
+    rawText = prepared.taskText;
+  }
+  state.lastTask = rawText;
+  state.lastTaskMode = permissionMode || null;
+  saveState();
   await rolloverIfNewDay();
   const stopTyping = startTyping();
-  const t0 = Date.now();
+  const status = startStatus(msgId, { title: permissionMode === 'plan' ? 'Planning (read-only)' : 'Working' });
+  try {
+    await runTask(rawText, msgId, Date.now(), { permissionMode, status });
+  } finally {
+    stopTyping();
+    status.stop();
+  }
+}
 
+async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
   // Explicit deep recall: "recall", "recall 3/5/10".
   const recallDays = parseRecall(rawText);
   let taskText = rawText, contextPrefix;
   if (recallDays) {
     contextPrefix = buildRecallContext(recallDays);
     if (!contextPrefix) {
-      stopTyping();
-      await sendChunked('No archived daily summaries yet to recall.', { mode: 'rich' });
+      await sendChunked('No archived daily summaries yet to recall.', { mode: 'rich', replyTo: msgId });
       return;
     }
     taskText = `Using the recalled summaries above, briefly tell me what you now remember from the last ${recallDays} day(s).`;
   }
+  if (permissionMode === 'plan') taskText = PLAN_NOTE + taskText;
+  const opts = { replyTo: msgId, permissionMode, onEvent: status ? (ev) => status.step(ev) : undefined };
 
   let result, ok, code, forked, actualId;
   // A daemon restart or expiry clears the pinned session. Restore archive context
   // before the fresh first turn instead of waiting for Claude to fail visibly.
   if (!contextPrefix && !state.sessionId) contextPrefix = await buildRestoreContext();
-  try {
-    ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { contextPrefix }));
-  } finally {
-    stopTyping();
-  }
-  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+  ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { ...opts, contextPrefix }));
 
   // Loud resume failure → retry fresh, restoring context from the archive.
   if (!ok && result === '__SESSION_EXPIRED__') {
     log('session expired — retrying fresh with restored context');
     const ctx = await buildRestoreContext();
-    const typing = startTyping();
-    try { ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { contextPrefix: ctx || contextPrefix })); }
-    finally { typing(); }
-  }
-
-  if (!ok) {
-    await tgReact(msgId, '💔');
-    await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich' });
-    return;
+    ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { ...opts, contextPrefix: ctx || contextPrefix }));
   }
 
   // Silent fork (idle / reboot): the first reply was context-less. Restore our
   // history from the archive and re-run so the answer is informed.
-  if (forked) {
+  if (ok && forked) {
     const ctx = await buildRestoreContext();
     if (ctx) {
       log('fork detected — re-running with restored context');
-      const typing = startTyping();
-      try { ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { contextPrefix: ctx })); }
-      finally { typing(); }
-      await sendChunked('↻ The previous session had dropped — I restored our recent history from the archive and continued.', { mode: 'rich' });
+      ({ ok, text: result, code, forked, actualId } = await runClaude(taskText, { ...opts, contextPrefix: ctx }));
+      if (ok) await sendChunked('↻ The previous session had dropped — I restored our recent history from the archive and continued.', { mode: 'rich' });
     } else {
       await sendChunked('⚠️ **Heads up:** previous session could not be resumed and there is no archive yet to restore from. Continuing fresh.', { mode: 'rich' });
     }
+  }
+  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+
+  if (!ok && result === '__STOPPED__') {
+    log(`task stopped by /stop after ${dt}s`);
+    await tgClearReaction(msgId);
+    await sendChunked(`⏹ <b>Stopped</b> after ${dt}s.`, { mode: 'html', replyTo: msgId });
+    return;
+  }
+  if (!ok) {
+    await tgReact(msgId, '💔');
+    await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich', replyTo: msgId });
+    return;
   }
 
   const trimmed = stripAnsi(result || '').trim();
@@ -841,63 +1251,242 @@ async function handleMessage(rawText, msgId) {
   if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) {
     replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
   }
-  appendArchive({ day: state.day, ts: new Date().toISOString(), user: rawText, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
+  appendArchive({ day: state.day, ts: new Date().toISOString(), user: permissionMode === 'plan' ? `/plan ${rawText}` : rawText, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
 
-  // Relay to the user.
+  // Relay to the user. Every successful path ends with the 🎉 "done" reaction,
+  // including the usual one where the agent already answered through tg_send.
   if (TG_SENT_SENTINEL.test(trimmed)) {
     log(`relay suppressed: agent used tg_send sentinel (${dt}s, stdout=${trimmed.length} chars)`);
-    return;
-  }
-  if (!trimmed) {
+  } else if (!trimmed) {
     log(`relay suppressed: empty stdout (${dt}s)`);
-    return;
+  } else {
+    // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
+    // with the looksTabular() <pre> fallback inside sendChunked.
+    const header = permissionMode === 'plan' ? '🧪 **Plan (read-only, nothing was changed).** Reply *go ahead* to carry it out.\n\n' : '';
+    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId });
   }
-  // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
-  // with the looksTabular() <pre> fallback inside sendChunked.
-  await sendChunked(trimmed, { mode: 'rich' });
   await tgReact(msgId, '🎉');
 }
 
+// ---------- Task queue ----------
+// Messages that arrive while a task runs wait here (persisted in state, so a
+// daemon restart keeps them) and run in order. One task at a time: Telegram
+// tasks share one Claude session, and the Hermes queue shares the same `busy`.
 let busy = false;
+let currentItem = null; // { text, msgId, startedAt }
+
+function itemLabel(item) {
+  if (item.media) return `${{ photo: '📸', voice: '🎙', audio: '🎵', video: '🎬' }[item.media.kind] || '📎'} ${item.text || item.media.name}`;
+  return item.text;
+}
+
+function enqueue(item) {
+  state.queue.push({ ...item, ts: new Date().toISOString() });
+  saveState();
+  if (busy || state.queue.length > 1) {
+    tgReact(item.msgId, '✍');
+    tgApi('sendMessage', {
+      chat_id: config.chat_id,
+      text: `📥 Queued #${state.queue.length} — runs after the current task. /queue to see, /stop all to drop.`,
+      disable_notification: true,
+      reply_parameters: { message_id: item.msgId, allow_sending_without_reply: true },
+    }).catch(e => log(`queue ack: ${e.message}`));
+  }
+  drainQueue();
+}
+
+async function drainQueue() {
+  while (!busy && state.queue.length) {
+    busy = true;
+    const item = state.queue.shift();
+    saveState();
+    currentItem = { ...item, startedAt: Date.now() };
+    try { await handleMessage(item); }
+    catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`, { mode: 'plain', replyTo: item.msgId }); } catch (_) {} }
+    currentItem = null;
+    busy = false;
+  }
+}
+
+// ---------- Side tasks (/bg) ----------
+// Isolated sessions that run in parallel with the main conversation. They get
+// the archive context but never touch the pinned session or the queue.
+const MAX_BG_TASKS = 2;
+
+function startBgTask(argument, msgId) {
+  if (!argument) return 'Usage: <code>/bg &lt;task&gt;</code>: runs in its own session, in parallel with the main chat.';
+  if (bgTasks.size >= MAX_BG_TASKS) return `⚡ ${MAX_BG_TASKS} side tasks are already running. Wait for one, or <code>/stop bg</code>.`;
+  const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now() };
+  bgTasks.set(msgId, entry);
+  runBgTask(entry, msgId)
+    .catch(e => log(`bg: ${e.stack || e.message}`))
+    .finally(() => bgTasks.delete(msgId));
+  return '⚡ <b>Side task started</b> in its own session. The main chat stays free; <code>/stop bg</code> cancels it.';
+}
+
+async function runBgTask(entry, msgId) {
+  tgReact(msgId, '👀');
+  const status = startStatus(msgId, { title: 'Side task' });
+  const t0 = Date.now();
+  try {
+    const contextPrefix = await buildRestoreContext();
+    if (entry.stopped) { await tgClearReaction(msgId); return; }
+    const task = `[Side task from Telegram (/bg): it runs in its own session, in parallel with the main conversation.]\n\n${entry.text}`;
+    const { ok, text: result, code, actualId } = await runClaude(task, {
+      contextPrefix, isolated: true, replyTo: msgId, source: 'bg',
+      onEvent: (ev) => status.step(ev),
+      onSpawn: (handle) => { entry.handle = handle; if (entry.stopped) stopHandle(handle, '/stop bg'); },
+    });
+    const dt = ((Date.now() - t0) / 1000).toFixed(1);
+    if (!ok && result === '__STOPPED__') {
+      await tgClearReaction(msgId);
+      await sendChunked(`⏹ <b>Side task stopped</b> after ${dt}s.`, { mode: 'html', replyTo: msgId });
+      return;
+    }
+    if (!ok) {
+      await tgReact(msgId, '💔');
+      await sendChunked(`**Side task failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich', replyTo: msgId });
+      return;
+    }
+    const trimmed = stripAnsi(result || '').trim();
+    let replyForArchive = trimmed;
+    if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
+    appendArchive({ day: state.day || localDayKey(), ts: new Date().toISOString(), source: 'bg', user: `/bg ${entry.text}`, assistant: replyForArchive, sessionId: actualId });
+    if (trimmed && !TG_SENT_SENTINEL.test(trimmed)) {
+      await sendChunked(`⚡ **Side task done** (${dt}s)\n\n${trimmed}`, { mode: 'rich', replyTo: msgId });
+    }
+    await tgReact(msgId, '🎉');
+  } finally {
+    status.stop();
+  }
+}
+
+function formatQueue() {
+  const lines = ['<b>📋 Queue</b>', ''];
+  if (currentItem) {
+    lines.push(`▶️ <b>Running</b> (${formatUptime((Date.now() - currentItem.startedAt) / 1000)}): <i>${htmlEscape(shorten(itemLabel(currentItem)))}</i>`);
+  } else if (busy) {
+    lines.push('▶️ <b>Running</b>: a Hermes queue task');
+  } else {
+    lines.push('💤 Idle — nothing running.');
+  }
+  for (const entry of bgTasks.values()) {
+    lines.push(`⚡ <b>Side task</b> (${formatUptime((Date.now() - entry.startedAt) / 1000)}): <i>${htmlEscape(shorten(entry.text))}</i>`);
+  }
+  state.queue.forEach((item, i) => lines.push(`${i + 1}. <i>${htmlEscape(shorten(itemLabel(item)))}</i>`));
+  if (!state.queue.length) lines.push('', 'Nothing waiting.');
+  return lines.join('\n');
+}
+
+function stopCommand(argument) {
+  const scope = String(argument || '').trim().toLowerCase();
+  const parts = [];
+  if (scope === 'bg' || scope === 'all') {
+    let n = 0;
+    for (const entry of bgTasks.values()) {
+      if (entry.stopped) continue;
+      entry.stopped = true; n++;
+      if (entry.handle) stopHandle(entry.handle, '/stop bg');
+    }
+    parts.push(n ? `⏹ Stopping ${n} side task(s)…` : 'No side task is running.');
+    if (scope === 'bg') return parts.join('\n');
+  }
+  const dropAll = scope === 'all';
+  const dropped = dropAll ? state.queue.splice(0) : [];
+  if (dropped.length) {
+    saveState();
+    for (const item of dropped) tgClearReaction(item.msgId);
+  }
+  parts.unshift(stopActiveTask() ? '⏹ Stopping the running task…' : 'No main task is running.');
+  if (dropAll) parts.push(dropped.length ? `🗑 Dropped ${dropped.length} queued message(s).` : 'The queue was already empty.');
+  else if (state.queue.length) parts.push(`${state.queue.length} queued message(s) will still run. Use /stop all to drop them.`);
+  return parts.join('\n');
+}
+
+// Routes one incoming Telegram message. fromAsker: it came back through the
+// daemon inbox from a waiting tg_ask / approval, so it is not their answer.
+async function dispatchMessage(m, { fromAsker = false } = {}) {
+  if (!m || !m.chat) return;
+  if (String(m.chat.id) !== String(config.chat_id)) { log(`ignored msg from chat ${m.chat.id}`); return; }
+  const media = mediaOf(m);
+  const text = media ? (m.caption || '') : (m.text || '');
+  if (!media && !text) return; // stickers, polls, service messages
+  if (!media) {
+    const parsed = parseTelegramCommand(text);
+    if (parsed && parsed.command === 'bg') {
+      await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
+      return;
+    }
+    if (isImmediateCommand(text)) {
+      try { await sendChunked((await telegramCommand(text)).reply, { mode: 'html', replyTo: m.message_id }); }
+      catch (e) { log(`command: ${e.stack || e.message}`); }
+      return;
+    }
+    if (!fromAsker && handshake.askActive()) {
+      try { handshake.handOffToAsk(m); log(`handed message ${m.message_id} to the waiting asker`); return; }
+      catch (e) { log(`handoff: ${e.message}`); }
+    }
+  }
+  enqueue({ text, msgId: m.message_id, media: media || undefined });
+}
+
 async function pollLoop() {
   log(`ready — workdir=${WORKDIR} chat_id=${config.chat_id} session_resumed=${state.sessionStarted}`);
+  drainQueue(); // messages queued before a restart
   while (true) {
+    for (const m of handshake.takeDaemonInbox()) await dispatchMessage(m, { fromAsker: true });
+    // tg_ask / the approval hook own getUpdates while they wait; a second
+    // consumer would steal their reply.
+    if (handshake.askActive()) { await new Promise(r => setTimeout(r, 1000)); continue; }
     let updates;
     try {
       updates = await tgApi('getUpdates', {
         offset: state.updateOffset,
-        timeout: 60,
+        // Short polls while work runs, so a starting tg_ask takes over quickly.
+        timeout: busy || bgTasks.size ? 10 : 50,
         allowed_updates: ['message'],
       }, { httpTimeoutMs: 75 * 1000 });
     } catch (e) {
-      log(`getUpdates: ${e.message} — backoff 5s`);
-      await new Promise(r => setTimeout(r, 5000));
+      // 409 Conflict = tg_ask just started polling; the loop pauses on its flag.
+      const conflict = /Conflict/i.test(e.message);
+      if (!conflict) log(`getUpdates: ${e.message} — backoff 5s`);
+      await new Promise(r => setTimeout(r, conflict ? 1000 : 5000));
       continue;
     }
     for (const u of updates) {
       state.updateOffset = u.update_id + 1;
       saveState();
-      const m = u.message;
-      if (!m || !m.text) continue;
-      if (String(m.chat.id) !== String(config.chat_id)) {
-        log(`ignored msg from chat ${m.chat.id}`);
-        continue;
-      }
-      if (busy) {
-        await tgApi('sendMessage', { chat_id: config.chat_id, text: `Busy — message queued won't run. Send again after current task completes.` });
-        continue;
-      }
-      busy = true;
-      tgReact(m.message_id, '👀');
-      try { await handleMessage(m.text, m.message_id); }
-      catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`, { mode: 'plain' }); } catch (_) {} }
-      busy = false;
+      if (u.message) await dispatchMessage(u.message);
     }
   }
 }
 
-process.on('SIGINT', () => { log('SIGINT, exiting'); releaseLock(); process.exit(0); });
-process.on('SIGTERM', () => { log('SIGTERM, exiting'); releaseLock(); process.exit(0); });
+// ---------- Online / Offline in the bot profile ----------
+// The bot's short description (shown on its profile and in an empty chat)
+// says whether the daemon is up. A hard kill or power loss cannot update it,
+// so Online carries a "checked" time refreshed every 10 minutes: a stale time
+// means the daemon is gone.
+const PRESENCE_EVERY_MS = 10 * 60 * 1000;
+function presenceClock() {
+  return new Date().toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+function setPresence(online) {
+  const text = online
+    ? `🟢 Online — Claude Code bridge · checked ${presenceClock()}`
+    : `🔴 Offline since ${presenceClock()} — Claude Code bridge`;
+  return tgApi('setMyShortDescription', { short_description: text }, { httpTimeoutMs: 5000 })
+    .catch(e => log(`presence: ${e.message}`));
+}
+
+async function shutdown(signal) {
+  log(`${signal}, exiting`);
+  await Promise.race([setPresence(false), new Promise(r => setTimeout(r, 3000))]);
+  releaseLock();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('exit', releaseLock);
 
 // ---------- Hermes queue poller ----------
@@ -947,10 +1536,14 @@ async function hermesQueuePoll() {
       log(`hermes-queue: task ${q.id} threw: ${e.message}`);
     }
     busy = false;
+    drainQueue(); // Telegram messages that arrived during the queue task
   }, 5000);
 }
 
 acquireLock();
+writeDaemonSettings();
 registerTelegramCommandMenu();
-pollLoop().catch((e) => { log(`fatal: ${e.stack || e.message}`); releaseLock(); process.exit(1); });
+setPresence(true);
+setInterval(() => setPresence(true), PRESENCE_EVERY_MS);
+pollLoop().catch(async (e) => { log(`fatal: ${e.stack || e.message}`); await setPresence(false); releaseLock(); process.exit(1); });
 hermesQueuePoll();
