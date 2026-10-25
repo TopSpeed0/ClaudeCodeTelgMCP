@@ -140,12 +140,17 @@ Runs independently, long-polling Telegram for messages. Each message becomes a `
 - Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) after a one-time setup (see [Voice Notes](#optional-voice-notes)). Audio is decoded with ffmpeg when available. Notes that mix languages (e.g. English and Hebrew) are re-transcribed per segment so each part stays in its own language instead of being translated; that path takes about four times longer
 - Collapses long code blocks into tap-to-expand quotes; answers longer than two messages arrive as the first part plus the full text as a file
 - Shows 🟢 Online / 🔴 Offline in the bot's profile, with a "checked" time refreshed every 10 minutes
-- Gates risky actions: daemon sessions load a PreToolUse hook (`mcp/telegram-approval-hook.js`) that holds sending mail, cluster writes, deletes, pushes and API writes until you tap ✅ / ❌ (no answer in 10 minutes = denied; rules and switch under `approval`)
+- Gates risky actions: daemon sessions load a PreToolUse hook (`mcp/telegram-approval-hook.js`) that holds sending mail, cluster writes, deletes, pushes and API writes until you tap ✅ / ❌ (no answer in 10 minutes = denied; rules and switch under `approval`). MCP tools ask when their name contains a changing verb as a whole word (`delete_volume`, `break_mirror`, `addCommentToIssue`), so reads such as `k8s_list_daemonsets` run freely
+- Uses the same MCP servers as Claude Code on this machine: the ones registered with `claude mcp add` (user, project and local scope, local or remote, such as servers hosted on a Kubernetes cluster) plus the daemon's own connectors in `mcp-connectors.json`
 
 Telegram commands (published to the bot's `/` menu at startup):
 - **Answered at once, even mid-task:** `/status`, `/stop` (`/stop all` also empties the queue and stops side tasks, `/stop bg` side tasks only), `/queue`, `/usage` (cost, turns, tokens and time for the last task and today), `/bg <task>` (side task in its own session, in parallel), `/mcp`, `/skills`, `/help`
 - **Run in turn with tasks:** `/plan <task>` (read-only run: looks and proposes, changes nothing), `/retry` (re-run your last message), `/new` or `/clear`, `/model [name]`
-- Installed skill names work as commands too; they are forwarded to Claude as tasks.
+- **Every MCP server and every skill gets its own entry, found automatically.** Nothing is hard-coded: the menu is rebuilt at startup, on `/mcp` and on `/skills`.
+  - **MCP servers** (🔌) come from the same configs Claude Code loads. Each one is asked the standard MCP way (`initialize`, then `tools/list`, over stdio or HTTP) what tools it has (`mcp/mcp-discovery.js`). Tap one alone to list its tools instantly, without starting Claude; add a request (`/storage list volumes over 90%`) to run a task that uses that server.
+  - **Skills** (🧩) are every folder in `~/.claude/skills` that has a `SKILL.md`; the menu text is the first sentence of its description. Tap one alone and Claude explains what it does without running anything; add a request to run it.
+  - **Names** follow Telegram's rules (`a-z`, `0-9`, `_`, at most 32 characters): `team-vm-manager` → `/team_vm_manager`, `über-tool` → `/uber_tool`. A name that clashes with a built-in or another entry gets `_2`, `_3` …; a name without Latin letters becomes `/skill_<hash>`. `/skills` shows the real name next to any renamed entry.
+  - Telegram allows 100 menu commands. Anything past that still works when typed, and `/skills` and the daemon log list what did not fit.
 
 While `tg_ask` or the approval hook waits for your reply it owns Telegram polling (`mcp/telegram-handshake.js`): it writes `.telegram-ask.active`, the daemon pauses, a reply the daemon caught just before pausing is handed over through `.telegram-ask-handoff.json`, and messages meant for the daemon (`/stop`, new tasks) go back through `.telegram-daemon-inbox.json`.
 

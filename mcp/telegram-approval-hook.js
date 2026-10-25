@@ -34,8 +34,29 @@ const DEFAULT_RULES = [
   ['stop or restart', /\b(Stop-Computer|Restart-Computer|Stop-Service|Restart-Service|Stop-VM|Restart-VM)\b|\bshutdown(\.exe)?\s+\/[rsp]\b|\bsystemctl\s+(stop|restart|disable)\b|\breboot\b/i],
   ['API write', /\b(Invoke-RestMethod|Invoke-WebRequest|irm|iwr)\b[^\n]*-Method\s+['"]?(Post|Put|Patch|Delete)\b|\bcurl(\.exe)?\b[^\n]*(-X\s*|--request\s+)['"]?(POST|PUT|PATCH|DELETE)\b/i],
 ];
-// MCP tools whose name says they change something. Telegram's own tools are exempt.
-const MCP_WRITE_TOOL = /^mcp__(?!telegram-tg__).*__\w*(create|delete|update|send|post|apply|remove|edit|write|transition|add|set|approve|reject)\w*$/i;
+// MCP tools whose name contains a changing verb as a whole word, so
+// break_mirror and addCommentToIssue ask, while k8s_list_daemonsets
+// and ipam_free_addresses do not. Telegram's own tools are exempt.
+const MCP_WRITE_VERBS = new Set([
+  'create', 'delete', 'update', 'send', 'post', 'put', 'patch', 'apply', 'remove', 'edit', 'write', 'set', 'add',
+  'transition', 'approve', 'reject', 'break', 'initialize', 'init', 'restore', 'resync', 'resize', 'modify', 'rename',
+  'move', 'migrate', 'revert', 'rollback', 'start', 'stop', 'restart', 'reboot', 'shutdown', 'poweroff', 'enable',
+  'disable', 'mount', 'unmount', 'attach', 'detach', 'clone', 'split', 'abort', 'cancel', 'quiesce', 'resume',
+  'promote', 'failover', 'reset', 'truncate', 'purge', 'wipe', 'execute', 'exec', 'invoke', 'upload',
+  'import', 'assign', 'unassign', 'grant', 'revoke', 'lock', 'unlock', 'kill', 'terminate', 'destroy', 'offline',
+  'online', 'restrict', 'drain', 'cordon', 'scale', 'deploy', 'install', 'uninstall', 'publish', 'merge', 'close',
+  'reopen', 'archive', 'unarchive', 'release', 'snooze', 'acknowledge', 'ack', 'clear', 'flush', 'evacuate', 'evict',
+]);
+
+function mcpToolWords(toolName) {
+  const tool = String(toolName).split('__').pop();
+  return tool.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function isMcpWriteTool(toolName) {
+  if (/^mcp__telegram-tg__/i.test(toolName)) return false;
+  return mcpToolWords(toolName).some(word => MCP_WRITE_VERBS.has(word));
+}
 
 function loadRuntime() {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'agent-runtime.json'), 'utf-8')).approval || {}; }
@@ -58,7 +79,7 @@ function classify(toolName, input, extraPatterns) {
   }
   if (toolName.startsWith('mcp__')) {
     const text = `${toolName} ${JSON.stringify(input || {})}`;
-    if (MCP_WRITE_TOOL.test(toolName)) return { label: 'MCP write tool', text };
+    if (isMcpWriteTool(toolName)) return { label: 'MCP write tool', text };
     const hit = rules.find(([, re]) => re.test(text));
     return hit ? { label: hit[0], text } : null;
   }
@@ -131,6 +152,8 @@ async function main() {
       chat_id: config.chat_id, message_id: sent.message_id, parse_mode: 'HTML',
       text: `${verdict} — ${htmlEscape(match.label)}\n<pre>${htmlEscape(shown)}</pre>\n<i>${htmlEscape(how)}</i>`,
     }).catch(() => {});
+    // Mark the answer as read on Telegram, or the daemon would later run it as a new task.
+    await api('getUpdates', { offset, timeout: 0, limit: 1 }, 5000).catch(() => {});
     return decide(allowed ? 'allow' : 'deny', allowed ? `Operator approved on Telegram (${how}).` : `Operator denied this on Telegram (${how}). Do not retry it; tell the user what was blocked.`);
   };
 

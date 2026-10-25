@@ -349,6 +349,14 @@ async function tgTyping(seconds, action) {
   return `Sent ${pulses} "${act}" pulse${pulses === 1 ? '' : 's'} over ${total}s.`;
 }
 
+// Telegram marks an update as read only when a later getUpdates asks for a
+// higher offset. Returning straight after the answer would leave it unread,
+// and the task daemon would pick it up again as a new task, so confirm it.
+async function confirmUpdatesBefore(offset) {
+  try { await tgApi('getUpdates', { offset, timeout: 0, limit: 1 }, { httpTimeoutMs: 5000 }); }
+  catch (e) { process.stderr.write(`[telegram-tg] confirm offset ${offset}: ${e.message}\n`); }
+}
+
 async function tgAsk(...args) {
   setAskFlag(true);
   try { return await tgAskWait(...args); }
@@ -439,6 +447,7 @@ async function tgAskWait(question, timeoutSeconds, parseMode, opts = {}) {
         tgApi('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
         if (cq.message) lastReceivedMessageId = cq.message.message_id;
         startTypingKeeper(chatId);
+        await confirmUpdatesBefore(updateOffset);
         const idx = Number(cq.data);
         return choices && Number.isInteger(idx) && choices[idx] != null ? choices[idx] : String(cq.data);
       }
@@ -453,6 +462,7 @@ async function tgAskWait(question, timeoutSeconds, parseMode, opts = {}) {
       const text = m.text || m.caption || '(non-text message)';
       // Auto-start a sustained typing indicator the instant a message is caught.
       startTypingKeeper(chatId);
+      await confirmUpdatesBefore(updateOffset);
       return text;
     }
   }

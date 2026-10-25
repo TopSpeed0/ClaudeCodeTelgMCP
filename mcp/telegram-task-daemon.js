@@ -17,9 +17,13 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
-const { TELEGRAM_COMMANDS, parseTelegramCommand, isImmediateCommand, routeTelegramCommand } = require('./telegram-command-router');
+const {
+  parseTelegramCommand, isImmediateCommand, routeTelegramCommand,
+  telegramCommandName, mcpCommandNames, skillCommandNames, skillMenuDescription, buildCommandMenu,
+} = require('./telegram-command-router');
 const { resolveQueueModel } = require('./queue-model');
 const handshake = require('./telegram-handshake');
+const { collectMcpServers, discoverMcpServers, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -476,7 +480,12 @@ function writeDaemonSettings() {
 //   permissionMode   e.g. 'plan' (read-only) instead of skipping permission checks.
 //   onEvent(ev)      live progress: switches to stream-json; `out` is still the
 //                    final result envelope, the same shape as --output-format json.
-function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, replyTo, permissionMode, onEvent } = {}) {
+//   nativeMcp        load the MCP servers registered in Claude Code itself (user,
+//                    project and local scope, the same set `claude mcp list`
+//                    shows) on top of the daemon's own connectors. Summaries
+//                    pass false: they need no tools, and connecting to every
+//                    server would only slow them down.
+function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, replyTo, permissionMode, onEvent, nativeMcp = true } = {}) {
   return new Promise((resolve) => {
     const oversized = task.length > MAX_PROMPT_ARG_CHARS;
     const promptArg = oversized
@@ -485,8 +494,9 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, rep
     const args = ['-p', promptArg,
                   '--model', String(model),
                   '--output-format', onEvent ? 'stream-json' : 'json',
-                  '--mcp-config', EMPTY_MCP, '--strict-mcp-config',
+                  '--mcp-config', EMPTY_MCP,
                   '--settings', DAEMON_SETTINGS];
+    if (!nativeMcp) args.push('--strict-mcp-config');
     if (onEvent) args.push('--verbose'); // stream-json in print mode requires it
     // Bypass would override plan mode, so a read-only run must not skip checks.
     if (permissionMode) args.push('--permission-mode', permissionMode);
@@ -549,7 +559,7 @@ async function summarize(label, body) {
   const prompt = `Summarize the following ${label} concisely in 4-8 short bullet points. `
     + `Capture facts, decisions, names, numbers, and open threads that future context would need. `
     + `Output ONLY the summary, no preamble.\n\n${body}`;
-  const { code, out } = await claudeRaw(prompt, ['--session-id', crypto.randomUUID()]);
+  const { code, out } = await claudeRaw(prompt, ['--session-id', crypto.randomUUID()], { nativeMcp: false });
   if (code !== 0) return null;
   let env = null; try { env = JSON.parse(out.trim()); } catch (_) {}
   return env && typeof env.result === 'string' ? env.result.trim() : null;
@@ -1014,11 +1024,49 @@ async function buildRestoreContext() {
   return `[Context restore — the previous session could not be resumed; here is our conversation so far so you can continue seamlessly]\n\n${parts.join('\n\n')}`;
 }
 
+const SKILLS_DIR = path.join(process.env.USERPROFILE || process.env.HOME, '.claude', 'skills');
+
 function installedSkillNames() {
-  const home = process.env.USERPROFILE || process.env.HOME;
-  const dir = path.join(home, '.claude', 'skills');
-  try { return fs.readdirSync(dir).filter(name => fs.existsSync(path.join(dir, name, 'SKILL.md'))).sort(); }
+  try { return fs.readdirSync(SKILLS_DIR).filter(name => fs.existsSync(path.join(SKILLS_DIR, name, 'SKILL.md'))).sort(); }
   catch (_) { return []; }
+}
+
+// ---------- MCP servers in the "/" menu ----------
+// Names come straight from the MCP configs that task sessions load (Claude
+// Code's own registrations plus the daemon's connectors), so menu names are
+// stable from the first second; tools come from asking each server
+// (mcp-discovery.js) at startup and on /mcp.
+let mcpCatalog = { servers: [], at: null };
+
+function mcpNames() {
+  return Object.keys(collectMcpServers(WORKDIR, EMPTY_MCP));
+}
+
+async function refreshMcpCatalog() {
+  const t0 = Date.now();
+  mcpCatalog = await discoverMcpServers(EMPTY_MCP, WORKDIR);
+  const summary = mcpCatalog.servers.map(s => `${s.name}=${s.error ? 'error' : s.tools.length}`).join(' ');
+  log(`MCP discovery (${((Date.now() - t0) / 1000).toFixed(1)}s): ${summary || mcpCatalog.error || 'none'}`);
+}
+
+// The reply to a bare MCP tap: the server's own tool list, straight from discovery.
+function formatMcpServer(name, command) {
+  const server = mcpCatalog.servers.find(s => s.name === name);
+  const usage = `\n\nAdd a request to use it: <code>/${htmlEscape(command)} &lt;what you need&gt;</code>`;
+  if (!server) return `🔌 <b>${htmlEscape(name)}</b>: tools not discovered yet. Try again in a few seconds, or send /mcp.${usage}`;
+  if (server.error) return `🔌 <b>${htmlEscape(name)}</b> is not answering: <code>${htmlEscape(server.error)}</code>\nSend /mcp to check again.${usage}`;
+  if (server.remote) return `🔌 <b>${htmlEscape(name)}</b> is a remote MCP server; its tools are discovered when Claude uses it.${usage}`;
+  const tools = server.tools.map(t => `• <code>${htmlEscape(t.name)}</code>${t.description ? ` — ${htmlEscape(t.description)}` : ''}`).join('\n');
+  return `🔌 <b>${htmlEscape(name)}</b> — ${server.tools.length} tools\n<blockquote expandable>${tools}</blockquote>${usage}`;
+}
+
+// [{ name, description }] for the "/" menu, the description taken from SKILL.md.
+function installedSkills() {
+  return installedSkillNames().map((name) => {
+    let markdown = '';
+    try { markdown = fs.readFileSync(path.join(SKILLS_DIR, name, 'SKILL.md'), 'utf-8'); } catch (_) {}
+    return { name, description: skillMenuDescription(markdown, name) };
+  });
 }
 
 function daemonBuild() {
@@ -1077,6 +1125,7 @@ async function telegramCommand(rawText) {
   const mcp = () => mcpReadiness();
   return routeTelegramCommand(rawText, {
     skillNames: installedSkillNames(),
+    mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
         + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
@@ -1098,13 +1147,30 @@ async function telegramCommand(rawText) {
           ? `Claude daemon model changed to <code>${htmlEscape(selected)}</code>. The next task starts with a fresh session.`
           : `Model <code>${htmlEscape(argument)}</code> is not in the local allow-list. Use <code>/model</code>.`;
       },
-      mcp: () => {
-        const readiness = mcp();
-        return `<b>Claude MCP connectors</b>\n${readiness.details.length ? readiness.details.join('\n') : 'No enabled connectors.'}\n\nConfigured connectors start on demand for an agent task; this command does not run infrastructure probes.`;
+      mcp: async () => {
+        await refreshMcpCatalog();
+        const commands = await registerTelegramCommandMenu();
+        const named = mcpCommandNames(mcpNames());
+        const lines = mcpCatalog.servers.map((server) => {
+          const command = (named.find(entry => entry.name === server.name) || {}).command || server.name;
+          const status = server.error ? `⚠️ ${htmlEscape(server.error)}` : server.remote ? 'remote' : `${server.tools.length} tools`;
+          return `🔌 <code>/${htmlEscape(command)}</code> — ${status}`;
+        });
+        return `<b>MCP servers</b> (discovered from the servers themselves)\n${lines.join('\n') || 'None configured.'}\n\n`
+          + 'Tap one alone to see its tools, or add a request: <code>/storage list volumes over 90%</code>.'
+          + (commands ? `\n🔄 "/" menu refreshed (${commands.length} commands).` : '\n⚠️ Could not refresh the "/" menu; see the daemon log.');
       },
-      skills: () => {
+      skills: async () => {
         const names = installedSkillNames();
-        return names.length ? `<b>Installed skills (${names.length})</b>\n<code>${names.map(htmlEscape).join('\n')}</code>` : 'No installed skills found.';
+        const commands = await registerTelegramCommandMenu();
+        let menu = commands ? `\n\n🔄 "/" menu refreshed (${commands.length} commands).` : '\n\n⚠️ Could not refresh the "/" menu; see the daemon log.';
+        if (commands && commands.left.length) menu += `\n⚠️ Over Telegram's 100-command limit, so not in the menu (still usable by typing the command): ${commands.left.map(htmlEscape).join(', ')}`;
+        // Point out the real name only where it is not just dashes → underscores.
+        const lines = skillCommandNames(names, mcpNames()).map(({ name, command }) => htmlEscape(
+          command === name.toLowerCase().replace(/-/g, '_') ? `/${command}` : `/${command}  ← ${name}`));
+        return names.length
+          ? `<b>Installed skills (${names.length})</b>\n<code>${lines.join('\n')}</code>\n\nTap one alone to hear what it does, or add details to run it: <code>/skill_name your request</code>.${menu}`
+          : `No installed skills found.${menu}`;
       },
       stop: (argument) => stopCommand(argument),
       clear: () => {
@@ -1118,13 +1184,37 @@ async function telegramCommand(rawText) {
   });
 }
 
+// The "/" menu: daemon commands plus every installed skill. Returns the size,
+// or null when Telegram rejected it.
 async function registerTelegramCommandMenu() {
+  const servers = mcpNames().map((name) => {
+    const found = mcpCatalog.servers.find(server => server.name === name);
+    return { name, description: found ? mcpMenuDescription(found) : `🔌 ${name} MCP server` };
+  });
+  const commands = buildCommandMenu(installedSkills(), servers);
   try {
-    await tgApi('setMyCommands', { commands: TELEGRAM_COMMANDS });
-    log(`registered Telegram command menu (${TELEGRAM_COMMANDS.length} commands)`);
+    await tgApi('setMyCommands', { commands: commands.map(({ command, description }) => ({ command, description })) });
+    log(`registered Telegram command menu (${commands.length} commands${commands.left.length ? `; over Telegram's 100 limit: ${commands.left.join(', ')}` : ''})`);
+    return commands;
   } catch (error) {
     log(`setMyCommands failed: ${error.message}`);
+    return null;
   }
+}
+
+function skillMenuName(skill) {
+  const entry = skillCommandNames(installedSkillNames(), mcpNames()).find(item => item.name === skill);
+  return entry ? entry.command : telegramCommandName(skill);
+}
+
+// A skill picked from the menu. With details it runs as a normal skill
+// invocation; a bare tap only explains, because some skills act as soon as
+// they run (e.g. logging off every server).
+function skillTask(skill, argument) {
+  if (argument) return `/${skill} ${argument}`;
+  return `The user picked the "${skill}" skill from the Telegram command menu without any details. `
+    + 'Do not run anything yet. In two or three short lines, say what this skill can do for them and what you need to know, '
+    + `then suggest one or two example requests in the form "/${skillMenuName(skill)} <request>".`;
 }
 
 function shorten(text, max = 60) {
@@ -1158,6 +1248,8 @@ async function handleMessage(item) {
   } else if (!item.media) {
     const command = await telegramCommand(rawText);
     if (command.handled) { await sendChunked(command.reply, { mode: 'html', replyTo: msgId }); return; }
+    if (command.skillCommand) rawText = skillTask(command.skillCommand, command.argument);
+    if (command.mcpServer) rawText = `Use the "${command.mcpServer}" MCP server's tools (mcp__${command.mcpServer}__*) for this request, in preference to other tools: ${command.argument}`;
   }
   tgReact(msgId, '👀');
   if (item.media) {
@@ -1413,6 +1505,12 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
   if (!media && !text) return; // stickers, polls, service messages
   if (!media) {
     const parsed = parseTelegramCommand(text);
+    // A bare MCP tap is answered at once from the discovered tool list; no Claude run.
+    const mcpServer = parsed && !parsed.argument && (mcpCommandNames(mcpNames()).find(entry => entry.command === parsed.command) || {}).name;
+    if (mcpServer) {
+      await sendChunked(formatMcpServer(mcpServer, parsed.command), { mode: 'html', replyTo: m.message_id }).catch(e => log(`mcp reply: ${e.message}`));
+      return;
+    }
     if (parsed && parsed.command === 'bg') {
       await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
       return;
@@ -1542,7 +1640,10 @@ async function hermesQueuePoll() {
 
 acquireLock();
 writeDaemonSettings();
-registerTelegramCommandMenu();
+registerTelegramCommandMenu()
+  .then(() => refreshMcpCatalog())
+  .then(() => registerTelegramCommandMenu())
+  .catch(e => log(`menu/MCP discovery: ${e.message}`));
 setPresence(true);
 setInterval(() => setPresence(true), PRESENCE_EVERY_MS);
 pollLoop().catch(async (e) => { log(`fatal: ${e.stack || e.message}`); await setPresence(false); releaseLock(); process.exit(1); });
