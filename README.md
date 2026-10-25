@@ -88,6 +88,26 @@ To receive Telegram messages as Claude tasks while you're away:
 .\mcp\start-task-daemon.ps1 -Background  # detached — logs to mcp/task-daemon.log
 ```
 
+### (Optional) Voice Notes
+
+Voice notes are transcribed **locally**, on your machine's CPU; no audio leaves it. This needs a one-time setup. Without it, the bot replies that voice is not installed, and everything else works as usual.
+
+1. **Python 3.9+** with the `faster-whisper` package (about 100 MB with its dependencies, from PyPI):
+   ```powershell
+   python -m pip install faster-whisper
+   ```
+2. **ffmpeg** on `PATH` (recommended; for example `winget install Gyan.FFmpeg`). The script uses it to decode Telegram's Opus audio, which avoids PyAV version breakage.
+3. **Pick a model** in `agent-runtime.json` under `telegram.voice.model`. The model is a **separate one-time download** from Hugging Face into your user cache:
+   - `small`: about 500 MB, fast, fine for English
+   - `large-v3-turbo`: about 1.6 GB, much better for other languages such as Hebrew, about 20 s for a short note on a laptop CPU
+4. **Download the model before the first voice note.** The daemon gives a transcription 5 minutes, and a slow or proxied connection can take longer than that (the turbo download took about 7 minutes here). Run the script once by hand with any audio file:
+   ```powershell
+   python mcp\stt-faster-whisper.py C:\path\to\any-audio.ogg large-v3-turbo
+   ```
+5. Restart the daemon so it reads the model setting.
+
+Optional: `telegram.voice.language` (for example `"he"`) forces one language. Leave it empty to auto-detect, which also handles notes that mix languages.
+
 ## Getting Your Telegram Credentials
 
 1. **Bot Token**: Message [@BotFather](https://t.me/BotFather) on Telegram, create a new bot, copy the token
@@ -117,7 +137,7 @@ Runs independently, long-polling Telegram for messages. Each message becomes a `
 - Queues messages that arrive while a task runs and runs them in order; the queue survives a daemon restart
 - Shows live progress: one silent status message (elapsed time, step count, the last three tool steps), updated in place and deleted when the task ends (`telegram.progress` in `agent-runtime.json`)
 - Accepts photos and files: they are saved under `inbox/<day>/` (gitignored) and handed to Claude to read
-- Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) once it is installed (`pip install faster-whisper`; settings under `telegram.voice`, e.g. `"model": "large-v3-turbo"`). Audio is decoded with ffmpeg when available. Notes that mix languages (e.g. English and Hebrew) are re-transcribed per segment so each part stays in its own language instead of being translated; that path takes about four times longer
+- Transcribes voice notes locally with faster-whisper (`mcp/stt-faster-whisper.py`) after a one-time setup (see [Voice Notes](#optional-voice-notes)). Audio is decoded with ffmpeg when available. Notes that mix languages (e.g. English and Hebrew) are re-transcribed per segment so each part stays in its own language instead of being translated; that path takes about four times longer
 - Collapses long code blocks into tap-to-expand quotes; answers longer than two messages arrive as the first part plus the full text as a file
 - Shows 🟢 Online / 🔴 Offline in the bot's profile, with a "checked" time refreshed every 10 minutes
 - Gates risky actions: daemon sessions load a PreToolUse hook (`mcp/telegram-approval-hook.js`) that holds sending mail, cluster writes, deletes, pushes and API writes until you tap ✅ / ❌ (no answer in 10 minutes = denied; rules and switch under `approval`)
@@ -153,6 +173,7 @@ When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-
 - Node.js 18+ (22+ if you need `--use-system-ca` for corporate TLS)
 - PowerShell 7+ (for the launcher and shortcut scripts)
 - A Telegram bot token + your chat ID
+- Optional, for voice notes: Python 3.9+ with `faster-whisper`, ffmpeg, and a one-time Whisper model download (500 MB – 1.6 GB); see [Voice Notes](#optional-voice-notes)
 
 ## Hermes Overmind Integration
 
