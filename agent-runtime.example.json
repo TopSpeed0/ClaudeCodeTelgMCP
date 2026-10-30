@@ -25,7 +25,29 @@
     "progress": true,
     "rotate_tokens": 150000,
     "motd": true,
-    "voice": { "model": "small", "language": "" }
+    "voice": { "model": "small", "language": "" },
+    "sentry": {
+      "active": false,
+      "every_minutes": 5,
+      "cleared": true,
+      "sources": [
+        {
+          "name": "Monitoring",
+          "server": "your-monitoring-mcp",
+          "tool": "active_alerts",
+          "args": { "min_severity": 2 },
+          "list": "result",
+          "id": "AlertID",
+          "title": "AlertName",
+          "object": ["EntityCaption", "NodeCaption"],
+          "severity": "SeverityText",
+          "time": "TriggeredDateTime",
+          "skip_if": "Acknowledged",
+          "only": { "Severity": [2, 3] },
+          "object_lookup": { "tool": "get_entity", "args": { "id": "{EntityID}" }, "field": "entity.name" }
+        }
+      ]
+    }
   },
   "approval": {
     "enabled": true,

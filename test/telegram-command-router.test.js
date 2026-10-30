@@ -109,12 +109,12 @@ test('routes /refresh to its own handler, not to clear', async () => {
 });
 
 test('answers control commands immediately and queues the rest', () => {
-  for (const text of ['/stop', '/stop all', '/queue', '/status', '/usage@my_bot', '/doctor', '/bg check disks', '/remind 45m check', '/every list', '/search a1k-prd', '/progress quiet']) assert.equal(isImmediateCommand(text), true, text);
+  for (const text of ['/stop', '/stop all', '/queue', '/status', '/usage@my_bot', '/doctor', '/bg check disks', '/remind 45m check', '/every list', '/search a1k-prd', '/sentry off', '/progress quiet']) assert.equal(isImmediateCommand(text), true, text);
   for (const text of ['/clear', '/new', '/refresh', '/compact', '/model x', '/retry', '/plan fix it', '/team-vm-manager', 'stop']) assert.equal(isImmediateCommand(text), false, text);
 });
 
 test('publishes the exact local Telegram command menu', () => {
-  assert.deepEqual(TELEGRAM_COMMANDS.map(item => item.command), ['status', 'stop', 'queue', 'retry', 'plan', 'bg', 'remind', 'every', 'search', 'usage', 'doctor', 'progress', 'compact', 'refresh', 'new', 'model', 'mcp', 'skills', 'clear', 'help']);
+  assert.deepEqual(TELEGRAM_COMMANDS.map(item => item.command), ['status', 'stop', 'queue', 'retry', 'plan', 'bg', 'remind', 'every', 'search', 'sentry', 'usage', 'doctor', 'progress', 'compact', 'refresh', 'new', 'model', 'mcp', 'skills', 'clear', 'help']);
   for (const item of TELEGRAM_COMMANDS) {
     assert.match(item.command, /^[a-z0-9_]{1,32}$/);
     assert.ok(item.description.length > 0 && item.description.length <= 256);

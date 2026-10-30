@@ -78,11 +78,18 @@ function spawnServer(server, cwd) {
 }
 
 // One stdio server: { tools: [{ name, description }], error? }.
-function discoverStdioServer(server, cwd) {
+async function discoverStdioServer(server, cwd) {
+  const { result, error } = await stdioRequest(server, cwd, 'tools/list', {});
+  return error ? { tools: [], error } : { tools: toolsOf(result) };
+}
+
+// Start a stdio server, initialize it, send one request, stop it:
+// { result } or { error }.
+function stdioRequest(server, cwd, method, params) {
   return new Promise((resolve) => {
     let proc;
     try { proc = spawnServer(server, cwd); }
-    catch (e) { resolve({ tools: [], error: `could not start: ${e.message}` }); return; }
+    catch (e) { resolve({ error: `could not start: ${e.message}` }); return; }
     let buffer = '', stderr = '', settled = false;
     const finish = (result) => {
       if (settled) return;
@@ -91,10 +98,10 @@ function discoverStdioServer(server, cwd) {
       stopProcess(proc);
       resolve(result);
     };
-    const timer = setTimeout(() => finish({ tools: [], error: `no answer within ${DISCOVERY_TIMEOUT_MS / 1000}s` }), DISCOVERY_TIMEOUT_MS);
+    const timer = setTimeout(() => finish({ error: `no answer within ${DISCOVERY_TIMEOUT_MS / 1000}s` }), DISCOVERY_TIMEOUT_MS);
     const send = (msg) => { try { proc.stdin.write(`${JSON.stringify(msg)}\n`); } catch (_) {} };
-    proc.on('error', (e) => finish({ tools: [], error: `could not start: ${e.message}` }));
-    proc.on('exit', (code) => finish({ tools: [], error: `exited (code ${code}) ${stderr.trim().split('\n').pop() || ''}`.trim() }));
+    proc.on('error', (e) => finish({ error: `could not start: ${e.message}` }));
+    proc.on('exit', (code) => finish({ error: `exited (code ${code}) ${stderr.trim().split('\n').pop() || ''}`.trim() }));
     proc.stdin.on('error', () => {});
     proc.stderr.on('data', (d) => { stderr = (stderr + d.toString()).slice(-2000); });
     proc.stdout.on('data', (d) => {
@@ -106,12 +113,12 @@ function discoverStdioServer(server, cwd) {
         if (!line) continue;
         let msg; try { msg = JSON.parse(line); } catch (_) { continue; }
         if (msg.id === 1) {
-          if (msg.error) return finish({ tools: [], error: `initialize failed: ${msg.error.message}` });
+          if (msg.error) return finish({ error: `initialize failed: ${msg.error.message}` });
           send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-          send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+          send({ jsonrpc: '2.0', id: 2, method, params });
         } else if (msg.id === 2) {
-          if (msg.error) return finish({ tools: [], error: `tools/list failed: ${msg.error.message}` });
-          return finish({ tools: toolsOf(msg.result) });
+          if (msg.error) return finish({ error: `${method} failed: ${msg.error.message}` });
+          return finish({ result: msg.result });
         }
       }
     });
@@ -164,19 +171,45 @@ function postMcp(url, headers, body, sessionId) {
 }
 
 async function discoverHttpServer(server) {
+  const { result, error } = await httpRequest(server, 'tools/list', {});
+  return error ? { tools: [], error } : { tools: toolsOf(result) };
+}
+
+// Initialize an HTTP server's session and send one request: { result } or { error }.
+async function httpRequest(server, method, params) {
   const headers = expandAll(server.headers);
   const url = expandEnv(server.url);
   try {
     const init = await postMcp(url, headers, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO } });
-    if (init.message && init.message.error) return { tools: [], error: `initialize failed: ${init.message.error.message}` };
+    if (init.message && init.message.error) return { error: `initialize failed: ${init.message.error.message}` };
     await postMcp(url, headers, { jsonrpc: '2.0', method: 'notifications/initialized' }, init.sessionId).catch(() => {});
-    const list = await postMcp(url, headers, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, init.sessionId);
-    if (!list.message) return { tools: [], error: 'tools/list returned nothing' };
-    if (list.message.error) return { tools: [], error: `tools/list failed: ${list.message.error.message}` };
-    return { tools: toolsOf(list.message.result) };
+    const reply = await postMcp(url, headers, { jsonrpc: '2.0', id: 2, method, params }, init.sessionId);
+    if (!reply.message) return { error: `${method} returned nothing` };
+    if (reply.message.error) return { error: `${method} failed: ${reply.message.error.message}` };
+    return { result: reply.message.result };
   } catch (e) {
-    return { tools: [], error: e.message };
+    return { error: e.message };
   }
+}
+
+// Call one tool on a configured MCP server, the way a Claude session would,
+// and return its data: the structured result when the server sends one,
+// else the first text block parsed as JSON (or the text itself). Throws on
+// any failure, including a tool that reports isError.
+async function callMcpTool(workdir, daemonConfigFile, serverName, tool, args = {}) {
+  const server = collectMcpServers(workdir, daemonConfigFile)[serverName];
+  if (!server) throw new Error(`no MCP server named "${serverName}"`);
+  const transport = server.type || (server.url ? 'http' : 'stdio');
+  if (transport !== 'stdio' && transport !== 'http') throw new Error(`${serverName}: transport "${transport}" is not supported here`);
+  const params = { name: tool, arguments: args };
+  const { result, error } = transport === 'stdio'
+    ? await stdioRequest(server, workdir, 'tools/call', params)
+    : await httpRequest(server, 'tools/call', params);
+  if (error) throw new Error(`${serverName}.${tool}: ${error}`);
+  const text = ((result && result.content) || []).filter(c => c && c.type === 'text').map(c => c.text).join('\n');
+  if (result && result.isError) throw new Error(`${serverName}.${tool}: ${firstSentence(text, 200) || 'tool error'}`);
+  if (result && result.structuredContent) return result.structuredContent;
+  try { return JSON.parse(text); } catch (_) { return text; }
 }
 
 // Every native server, asked in parallel: [{ name, scope, transport, tools, error? }].
@@ -202,4 +235,4 @@ function mcpMenuDescription(server) {
   return firstSentence(`🔌 ${where} · ${server.tools.length} tools: ${sample}${more}`, 100);
 }
 
-module.exports = { collectMcpServers, discoverMcpServers, mcpMenuDescription, BRIDGE_SERVERS };
+module.exports = { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription, BRIDGE_SERVERS };

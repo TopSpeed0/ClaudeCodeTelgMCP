@@ -25,10 +25,11 @@ const {
 const { resolveQueueModel } = require('./queue-model');
 const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-schedule');
 const { snippet, searchArchive } = require('./archive-search');
+const { fill, pick, readAlerts, diffAlerts, muteKey } = require('./sentry-alerts');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
-const { collectMcpServers, discoverMcpServers, mcpMenuDescription } = require('./mcp-discovery');
+const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
@@ -1641,7 +1642,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — read-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating read-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — read-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating read-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
@@ -1654,9 +1655,10 @@ async function telegramCommand(rawText) {
       remind: (argument) => scheduleCommand('remind', argument),
       every: (argument) => scheduleCommand('every', argument),
       search: (argument) => searchView(argument).text,
+      sentry: () => sentryView().text,
       status: () => {
         const readiness = mcp();
-        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nSentry: <code>${SENTRY_SOURCES.length ? (sentryActive() ? `active, ${SENTRY_SOURCES.length} source(s)` : 'disabled') : 'not set up'}</code> (/sentry)\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -2017,10 +2019,12 @@ async function drainQueue() {
 // the archive context but never touch the pinned session or the queue.
 const MAX_BG_TASKS = 2;
 
-function startBgTask(argument, msgId) {
+// intro replaces the /bg preamble and permissionMode: 'plan' makes the run
+// read-only (🔎 Investigate under a sentry alert uses both).
+function startBgTask(argument, msgId, { intro, permissionMode } = {}) {
   if (!argument) return 'Usage: <code>/bg &lt;task&gt;</code>: runs in its own session, in parallel with the main chat.';
   if (bgTasks.size >= MAX_BG_TASKS) return `⚡ ${MAX_BG_TASKS} side tasks are already running. Wait for one, or <code>/stop bg</code>.`;
-  const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now() };
+  const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now(), intro, permissionMode };
   bgTasks.set(msgId, entry);
   markRunning(msgId, { kind: 'bg', text: argument });
   runBgTask(entry, msgId)
@@ -2036,9 +2040,10 @@ async function runBgTask(entry, msgId) {
   try {
     const contextPrefix = await buildRestoreContext();
     if (entry.stopped) { await tgClearReaction(msgId); return; }
-    const task = `[Side task from Telegram (/bg): it runs in its own session, in parallel with the main conversation.]\n\n${entry.text}`;
+    const intro = entry.intro || '[Side task from Telegram (/bg): it runs in its own session, in parallel with the main conversation.]';
+    const task = `${intro}\n\n${entry.text}`;
     const { ok, text: result, code, actualId } = await runClaude(task, {
-      contextPrefix, isolated: true, replyTo: msgId, source: 'bg',
+      contextPrefix, isolated: true, replyTo: msgId, source: 'bg', permissionMode: entry.permissionMode,
       onEvent: (ev) => status.step(ev),
       onSpawn: (handle) => { entry.handle = handle; if (entry.stopped) stopHandle(handle, '/stop bg'); },
     });
@@ -2312,6 +2317,219 @@ async function summarizeSearch({ query, hits }, replyTo, askId) {
   }
 }
 
+// ---------- Sentry mode (/sentry) ----------
+// Watches monitoring systems through their MCP servers, the same servers a
+// Claude session uses, with no Claude run: every few minutes each source in
+// agent-runtime.json (telegram.sentry.sources, see sentry-alerts.js) is
+// asked for its alerts, and what is new is posted with 🔎 Investigate (a
+// read-only side task) and 🔕 Mute 24h. A reported alert that goes away gets
+// a silent ✅ Cleared reply. The alerts already open when watching starts
+// (first run, or /sentry on) are only counted, not posted.
+const SENTRY = TELEGRAM_RUNTIME.sentry || {};
+const SENTRY_SOURCES = (Array.isArray(SENTRY.sources) ? SENTRY.sources : []).filter(s => s && s.name && s.server && s.tool);
+const SENTRY_EVERY_MS = Math.max(1, Number(SENTRY.every_minutes) || 5) * 60 * 1000;
+const SENTRY_MUTE_MS = 24 * 60 * 60 * 1000;
+const SENTRY_FAILS_TO_REPORT = 3; // a source that fails this many checks in a row is reported once
+let sentryChecking = false;
+
+function sentryState() {
+  if (!state.sentry) state.sentry = { active: SENTRY.active !== false, known: {}, baselined: {}, muted: {}, health: {} };
+  return state.sentry;
+}
+const sentryActive = () => SENTRY_SOURCES.length > 0 && sentryState().active;
+const alertRef = (key) => crypto.createHash('sha1').update(key).digest('hex').slice(0, 10);
+const findAlert = (ref) => Object.entries(sentryState().known).find(([key]) => alertRef(key) === ref) || [];
+
+function alertCard(entry) {
+  const when = entry.time ? tgTime(entry.time, 'wDT', shortTime(entry.time, true)) : '';
+  return `🚨 <b>${htmlEscape(entry.source)}</b>${entry.severity ? ` · ${htmlEscape(entry.severity)}` : ''}\n`
+    + `<b>${htmlEscape(entry.title)}</b>`
+    + `${entry.object ? `\n🖥 ${htmlEscape(entry.object)}` : ''}${when ? `\n🕒 since ${when}` : ''}`;
+}
+
+// A friendlier object name for a new alert (e.g. a resource id → its host
+// name) through the source's object_lookup tool. Falls back to what it had.
+async function lookupObject(source, alert) {
+  const lookup = source.object_lookup;
+  if (!lookup || !lookup.tool) return alert.object;
+  try {
+    const data = await callMcpTool(WORKDIR, EMPTY_MCP, lookup.server || source.server, lookup.tool, fill(lookup.args || {}, alert.item));
+    const name = pick(data, lookup.field);
+    return name ? String(name) : alert.object;
+  } catch (e) {
+    log(`sentry: ${source.name} lookup: ${e.message}`);
+    return alert.object;
+  }
+}
+
+async function sentryCheck() {
+  if (sentryChecking || !SENTRY_SOURCES.length) return;
+  sentryChecking = true;
+  const s = sentryState();
+  const firstLook = [];
+  try {
+    for (const source of SENTRY_SOURCES) {
+      const health = s.health[source.name] = s.health[source.name] || { fails: 0 };
+      let alerts;
+      try {
+        alerts = readAlerts(source, await callMcpTool(WORKDIR, EMPTY_MCP, source.server, source.tool, source.args || {}));
+      } catch (e) {
+        health.fails = (health.fails || 0) + 1;
+        health.error = e.message;
+        log(`sentry: ${source.name}: ${e.message}`);
+        if (health.fails === SENTRY_FAILS_TO_REPORT) {
+          await sendChunked(`🛰 <b>Sentry</b> cannot read <b>${htmlEscape(source.name)}</b> (${health.fails} checks in a row): <code>${htmlEscape(shorten(e.message, 200))}</code>\nStill trying every ${SENTRY_EVERY_MS / 60000} min.`, { mode: 'html' });
+        }
+        continue;
+      }
+      if (health.fails >= SENTRY_FAILS_TO_REPORT) await sendChunked(`🛰 <b>Sentry</b> reads <b>${htmlEscape(source.name)}</b> again.`, { mode: 'html' });
+      Object.assign(health, { fails: 0, error: null, at: Date.now(), open: alerts.length });
+
+      const { added, cleared } = diffAlerts(s.known, source.name, alerts);
+      const baseline = !s.baselined[source.name];
+      for (const alert of added) {
+        const entry = { source: source.name, title: alert.title, object: alert.object, severity: alert.severity, time: alert.time, at: Date.now() };
+        s.known[alert.key] = entry;
+        if (baseline) continue;
+        const muteUntil = s.muted[muteKey(source.name, alert)];
+        if (muteUntil && muteUntil > Date.now()) { entry.muted = true; continue; }
+        entry.muteKey = muteKey(source.name, alert);
+        entry.object = await lookupObject(source, alert);
+        entry.server = source.server;
+        entry.raw = JSON.stringify(alert.item).slice(0, 1500);
+        const ref = alertRef(alert.key);
+        const sent = await tgApi('sendMessage', {
+          chat_id: config.chat_id, parse_mode: 'HTML', text: alertCard(entry),
+          reply_markup: { inline_keyboard: [[
+            { text: '🔎 Investigate', callback_data: `sn:inv:${ref}`, style: 'primary' },
+            { text: '🔕 Mute 24h', callback_data: `sn:mute:${ref}` },
+          ]] },
+        }).catch(e => { log(`sentry: post: ${e.message}`); return null; });
+        if (sent) entry.msgId = sent.message_id;
+        log(`sentry: new ${alert.key}: ${alert.title}`);
+      }
+      for (const { key, entry } of cleared) {
+        delete s.known[key];
+        if (!entry.msgId || SENTRY.cleared === false) continue;
+        await tgApi('sendMessage', {
+          chat_id: config.chat_id, parse_mode: 'HTML', disable_notification: true,
+          text: `✅ <b>Cleared</b>: ${htmlEscape(entry.title)}${entry.object ? ` · ${htmlEscape(entry.object)}` : ''}`,
+          reply_parameters: { message_id: entry.msgId, allow_sending_without_reply: true },
+        }).catch(e => log(`sentry: cleared: ${e.message}`));
+      }
+      if (baseline) {
+        s.baselined[source.name] = true;
+        firstLook.push(`${htmlEscape(source.name)}: ${alerts.length}`);
+      }
+      saveState();
+    }
+    for (const [key, until] of Object.entries(s.muted)) if (until <= Date.now()) delete s.muted[key];
+    s.lastCheck = Date.now();
+    saveState();
+    if (firstLook.length) {
+      await tgApi('sendMessage', {
+        chat_id: config.chat_id, parse_mode: 'HTML', disable_notification: true,
+        text: `🛰 <b>Sentry is watching.</b> Already open, so not posted: ${firstLook.join(' · ')}. New alerts from now on will be posted. /sentry for status.`,
+      }).catch(e => log(`sentry: first look: ${e.message}`));
+    }
+  } finally {
+    sentryChecking = false;
+  }
+}
+
+function sentryView(note) {
+  if (!SENTRY_SOURCES.length) {
+    return { text: '🛰 <b>Sentry mode</b> is not set up: add sources under <code>telegram.sentry</code> in agent-runtime.json (see agent-runtime.example.json), then restart the bot.' };
+  }
+  const s = sentryState();
+  const lines = SENTRY_SOURCES.map((source) => {
+    const h = s.health[source.name] || {};
+    if (h.error) return `⚠️ <b>${htmlEscape(source.name)}</b>: ${htmlEscape(shorten(h.error, 120))}`;
+    if (h.open == null) return `▫️ <b>${htmlEscape(source.name)}</b>: not checked yet`;
+    const posted = Object.values(s.known).filter(e => e.source === source.name && e.msgId).length;
+    return `✅ <b>${htmlEscape(source.name)}</b>: ${h.open} open${posted ? `, ${posted} posted here` : ''}`;
+  });
+  const muted = Object.values(s.muted).filter(until => until > Date.now()).length;
+  const last = s.lastCheck ? tgTime(s.lastCheck, 'r', shortTime(s.lastCheck)) : 'not yet';
+  return {
+    text: `🛰 <b>Sentry mode</b>: ${s.active ? '🟢 Active' : '⚪ Disabled'}${note ? ` · ${htmlEscape(note)}` : ''}\n`
+      + `Every ${SENTRY_EVERY_MS / 60000} min, no Claude run · last check ${last}${muted ? ` · ${muted} muted` : ''}\n\n${lines.join('\n')}`,
+    reply_markup: { inline_keyboard: [[
+      { text: s.active ? '🟢 Active' : 'Activate', callback_data: 'sn:on', style: s.active ? 'success' : undefined },
+      { text: s.active ? 'Disable' : '⚪ Disabled', callback_data: 'sn:off', style: s.active ? undefined : 'danger' },
+      { text: '🔄 Check now', callback_data: 'sn:now' },
+    ]] },
+  };
+}
+
+// /sentry on|off|now, or the same from its buttons. Turning it on again
+// re-counts what is open instead of posting everything that came up meanwhile.
+function sentrySet(action) {
+  const s = sentryState();
+  if (action === 'on' && !s.active) { s.active = true; s.baselined = {}; saveState(); sentryCheck().catch(e => log(`sentry: ${e.stack || e.message}`)); return 'activated'; }
+  if (action === 'off' && s.active) { s.active = false; saveState(); return 'disabled'; }
+  if (action === 'now') return null;
+  return action === 'on' ? 'already active' : action === 'off' ? 'already disabled' : null;
+}
+
+async function sentryCommand(argument, replyTo) {
+  const action = String(argument || '').trim().toLowerCase();
+  let note = '';
+  if (SENTRY_SOURCES.length && ['on', 'off', 'active', 'disable', 'disabled'].includes(action)) note = sentrySet(action.startsWith('on') || action === 'active' ? 'on' : 'off');
+  if (SENTRY_SOURCES.length && action === 'now') { await sentryCheck(); note = 'checked just now'; }
+  const view = sentryView(note);
+  await tgApi('sendMessage', {
+    chat_id: config.chat_id, parse_mode: 'HTML', text: view.text, reply_markup: view.reply_markup,
+    reply_parameters: replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
+  }).catch(e => log(`sentry reply: ${e.message}`));
+}
+
+// Taps: on / off / now on the /sentry card; inv / mute under an alert.
+// Returns false when the button was not ours.
+function sentryButton(cq) {
+  const [tag, action, ref] = String(cq.data || '').split(':');
+  if (tag !== 'sn') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cq.id, text }).catch(() => {});
+  const redraw = (note) => {
+    const view = sentryView(note);
+    return tgApi('editMessageText', { chat_id: config.chat_id, message_id: cq.message.message_id, parse_mode: 'HTML', text: view.text, reply_markup: view.reply_markup }, { lowPriority: true })
+      .catch(e => { if (!/not modified/i.test(e.message)) log(`sentry edit: ${e.message}`); });
+  };
+  if (action === 'on' || action === 'off') {
+    const note = sentrySet(action);
+    answer(`Sentry ${note}`);
+    redraw(note);
+  } else if (action === 'now') {
+    answer('🔄 Checking…');
+    sentryCheck().then(() => redraw('checked just now')).catch(e => log(`sentry: ${e.stack || e.message}`));
+  } else {
+    const [key, entry] = findAlert(ref);
+    if (!entry) { answer('This alert has cleared or is too old.'); return true; }
+    if (action === 'mute') {
+      sentryState().muted[entry.muteKey || muteKey(entry.source, entry)] = Date.now() + SENTRY_MUTE_MS;
+      saveState();
+      answer('🔕 Muted for 24 h: this alert on this object.');
+    } else if (action === 'inv') {
+      const intro = '[Sentry alert triage from Telegram. This run is read-only: you cannot change anything, and tg_send is unavailable; '
+        + 'your final message is relayed. Find out what is wrong, how serious it is, the likely cause and what to do next, using the matching skills and '
+        + `MCP tools (the "${entry.server}" server first). Verdict first, then the evidence, then a short recommendation.]`;
+      const facts = `Source: ${entry.source}\nAlert: ${entry.title}\nObject: ${entry.object || '(none)'}\nSeverity: ${entry.severity || '(none)'}\n`
+        + `Since: ${entry.time ? new Date(entry.time).toISOString() : '(unknown)'}\nAlert key: ${key}\nRaw alert: ${entry.raw || '(not kept)'}`;
+      const reply = startBgTask(facts, cq.message.message_id, { intro, permissionMode: 'plan' });
+      answer(/already running/.test(reply) ? 'Two side tasks are already running; try again soon.' : '🔎 Investigating (read-only)…');
+      if (/already running/.test(reply)) sendChunked(reply, { mode: 'html', replyTo: cq.message.message_id }).catch(() => {});
+    }
+  }
+  if (action === 'inv' || action === 'mute') {
+    // Keep 🔎 Investigate after a mute; drop both after Investigate.
+    const keep = action === 'mute' ? [[{ text: '🔎 Investigate', callback_data: `sn:inv:${ref}`, style: 'primary' }]] : [];
+    tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: keep } }, { lowPriority: true })
+      .catch(e => log(`sentry buttons: ${e.message}`));
+  }
+  return true;
+}
+
 function formatQueue() {
   const lines = ['<b>📋 Queue</b>', ''];
   if (currentItem) {
@@ -2451,6 +2669,10 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
       return;
     }
+    if (parsed && parsed.command === 'sentry') {
+      await sentryCommand(parsed.argument, m.message_id);
+      return;
+    }
     if (parsed && parsed.command === 'search') {
       const view = searchView(parsed.argument);
       await sendChunked(view.text, { mode: 'html', replyTo: m.message_id, buttons: view.buttons }).catch(e => log(`search reply: ${e.message}`));
@@ -2514,7 +2736,7 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
-      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }
@@ -2750,6 +2972,10 @@ async function doctorReport() {
   add(lockPid === String(process.pid) ? 'ok' : 'warn', 'Lock', lockPid === String(process.pid) ? `held by this daemon (PID ${process.pid})` : `lock file says PID ${htmlEscape(String(lockPid))}, this daemon is ${process.pid}`);
   const outbox = (state.outbox || []).length;
   add(outbox ? 'warn' : 'ok', 'Delivery', `queue ${state.queue.length} · side tasks ${bgTasks.size}${outbox ? ` · ${outbox} answer(s) waiting to be resent` : ' · nothing undelivered'}`);
+  if (SENTRY_SOURCES.length) {
+    const failing = SENTRY_SOURCES.filter(src => ((sentryState().health[src.name] || {}).error)).map(src => src.name);
+    add(failing.length ? 'warn' : 'ok', 'Sentry', `${sentryActive() ? 'active' : 'disabled'} · ${SENTRY_SOURCES.length} source(s)${failing.length ? ` · not reading: ${failing.join(', ')}` : ''}`);
+  }
   const summaries = Object.keys(loadDailySummaries()).sort();
   add('ok', 'Archive', `${readDayTurns(state.day || localDayKey()).length} turns today · ${summaries.length} daily summaries${summaries.length ? ` (latest ${summaries[summaries.length - 1]})` : ''}`);
   add('ok', 'Daemon', `up ${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)} · build <code>${daemonBuild()}</code>`);
@@ -2829,6 +3055,12 @@ sendMotd(prevStop)
   .catch(e => log(`recovery: ${e.message}`))
   .then(() => prewarm())
   .then(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)))
-  .then(() => setInterval(() => scheduleTick().catch(e => log(`schedule: ${e.stack || e.message}`)), SCHEDULE_TICK_MS));
+  .then(() => setInterval(() => scheduleTick().catch(e => log(`schedule: ${e.stack || e.message}`)), SCHEDULE_TICK_MS))
+  .then(() => {
+    if (!SENTRY_SOURCES.length) return;
+    const check = () => { if (sentryActive()) sentryCheck().catch(e => log(`sentry: ${e.stack || e.message}`)); };
+    setTimeout(check, 60 * 1000); // once startup has settled
+    setInterval(check, SENTRY_EVERY_MS);
+  });
 pollLoop().catch(async (e) => { log(`fatal: ${e.stack || e.message}`); await setPresence(false); releaseLock(); process.exit(1); });
 hermesQueuePoll();

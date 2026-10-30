@@ -1,12 +1,12 @@
 'use strict';
 
-const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'search', 'progress']);
+const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'search', 'sentry', 'progress']);
 // Answered the moment they arrive, even while a task runs. /bg starts its own
 // isolated session at once; /remind and /every only store a job;
-// /search reads the archive. Everything else (tasks and state-changing commands
+// /search reads the archive; /sentry toggles the alert watch. Everything else (tasks and state-changing commands
 // such as /clear, /refresh, /compact, /model, /retry, /plan) waits its turn in the queue, so it
 // never races the running task.
-const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'search', 'progress']);
+const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'search', 'sentry', 'progress']);
 const COMMAND_ALIASES = { new: 'clear' };
 const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Daemon status and runtime' },
@@ -18,6 +18,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'remind', description: 'Read-only check later: /remind 45m <task> · /remind list' },
   { command: 'every', description: 'Repeating read-only check: /every weekdays 07:30 <task>' },
   { command: 'search', description: 'Find past conversations in the archive' },
+  { command: 'sentry', description: 'Alert watch: status, on, off, check now' },
   { command: 'usage', description: 'Cost, turns and time: last task and today' },
   { command: 'doctor', description: 'Health check: Telegram, Claude CLI, MCP, limits, autostart, disk' },
   { command: 'progress', description: 'How much live progress you see: off, quiet, normal, full' },
