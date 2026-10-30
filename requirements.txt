@@ -1,4 +1,4 @@
-# requirements.txt — ClaudeCodeTelgMCP runtime dependencies
+# requirements.txt — claude-telegram-bridge runtime dependencies
 #
 # Format:
 #   type:name:min_version:check_command

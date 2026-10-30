@@ -60,7 +60,7 @@ claude
 Clone the repo and run the wizard. It checks Node.js and Claude Code, tests the connection to Telegram (and turns on `--use-system-ca` when a corporate TLS proxy is in the way), asks for your bot token, finds your chat ID when you send the bot a message, writes the gitignored config files, and offers autostart at sign-in, Start Menu / Desktop shortcuts and a first start with a "Setup done" message:
 
 ```powershell
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; pwsh -File mcp/setup.ps1
+git clone https://github.com/TopSpeed0/claude-telegram-bridge.git; cd claude-telegram-bridge; pwsh -File mcp/setup.ps1
 ```
 
 Run it again any time to repair a setup: what exists is kept and only missing pieces are fixed (`-Reconfigure` asks for the bot again; `-Yes` accepts every default; `-NoAutostart`, `-NoShortcuts`, `-NoStart` skip those steps). Then send `/doctor` to the bot.
@@ -71,12 +71,12 @@ Manual alternative (and the macOS / Linux path). Copy-paste this single block �
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; Copy-Item .mcp.json.example .mcp.json; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
+git clone https://github.com/TopSpeed0/claude-telegram-bridge.git; cd claude-telegram-bridge; Copy-Item .mcp.json.example .mcp.json; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
 ```
 
 **macOS / Linux (bash):**
 ```bash
-git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git && cd ClaudeCodeTelgMCP && cp .mcp.json.example .mcp.json && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
+git clone https://github.com/TopSpeed0/claude-telegram-bridge.git && cd claude-telegram-bridge && cp .mcp.json.example .mcp.json && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
 ```
 
 After editing `.mcp.json` with your credentials:
