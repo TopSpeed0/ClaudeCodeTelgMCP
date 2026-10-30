@@ -3,9 +3,11 @@
 # Usage:
 #   .\mcp\start-task-daemon.ps1            # runs in foreground (current terminal)
 #   .\mcp\start-task-daemon.ps1 -Background # detaches; logs to mcp/task-daemon.log
+#   ... -Background -IfNotRunning           # start only if no daemon is alive
 
 param(
-  [switch]$Background
+  [switch]$Background,
+  [switch]$IfNotRunning
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +21,19 @@ trap {
   "[$(Get-Date -Format s)] start failed: $($_.Exception.Message)`n$($_.ScriptStackTrace)" |
     Add-Content -Path $startupLog -Encoding utf8
   break
+}
+
+# The supervising scheduled task re-runs this every few minutes. -IfNotRunning
+# turns that into a no-op while a daemon is alive, instead of a kill-and-restart
+# cycle that would drop whatever task the bot is in the middle of.
+if ($IfNotRunning) {
+  $live = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+  if ($live) {
+    Write-Host "Daemon already running (PID=$($live.ProcessId)); nothing to do."
+    exit 0
+  }
+  Write-Host "No daemon running — starting one."
 }
 
 # ── Requirements check ──
