@@ -95,6 +95,7 @@ function loadConfig() {
 const config = loadConfig();
 
 let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null, queue: [], lastTask: null, usage: null };
+let sessionExpiredAtStart = false; // for the startup banner
 try {
   const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8'));
   // Migrate old sessionStarted boolean → sessionId
@@ -107,6 +108,7 @@ try {
     if (idle > SESSION_TTL_MS) {
       log(`session ${state.sessionId} expired after ${Math.round(idle/60000)}m idle — starting fresh`);
       state.sessionId = null;
+      sessionExpiredAtStart = true;
     }
   }
 } catch (_) {}
@@ -147,7 +149,10 @@ function releaseLock() {
 // the real reply text when the agent answered via tg_send, not for resume).
 const PROJECT_DIR = (() => {
   const home = process.env.USERPROFILE || process.env.HOME;
+  // Claude Code turns every non-alphanumeric character into '-'
+  // (C:\Users\a b -> C--Users-a-b); the other two are older guesses.
   const candidates = [
+    WORKDIR.replace(/[^a-zA-Z0-9]/g, '-'),
     WORKDIR.replace(/[/\\]/g, '-').replace(/^-/, '').replace(/:/g, ''),
     WORKDIR.replace(/\\/g, '-').replace(/^-/, '').replace(/:/g, ''),
   ].map(enc => path.join(home, '.claude', 'projects', enc));
@@ -2151,7 +2156,59 @@ function previousStop() {
   return `⚠️ Unexpected stop, last seen ${seen} (killed or crashed)`;
 }
 
-function motdText(prevStop) {
+// Context size of a session = the prompt its last turn sent (fresh + cached
+// input), read from the tail of Claude's transcript.
+function sessionContextTokens(sessionId) {
+  try {
+    const file = path.join(PROJECT_DIR, `${sessionId}.jsonl`);
+    const size = fs.statSync(file).size;
+    const fd = fs.openSync(file, 'r');
+    const len = Math.min(size, 512 * 1024);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf-8').split('\n').reverse();
+    for (const line of lines) {
+      let ev; try { ev = JSON.parse(line); } catch (_) { continue; }
+      const u = ev.type === 'assistant' && ev.message && ev.message.usage;
+      if (u) return (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Plan limits (5-hour window and week) from the endpoint Claude Code's own
+// /usage reads, signed with the subscription token Claude Code keeps fresh.
+function planUsage() {
+  return new Promise((resolve) => {
+    let token;
+    try { token = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', '.credentials.json'), 'utf-8')).claudeAiOauth.accessToken; }
+    catch (_) { return resolve(null); }
+    const req = https.get({
+      hostname: 'api.anthropic.com', path: '/api/oauth/usage', timeout: 5000,
+      headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
+    }, (res) => {
+      let body = '';
+      res.on('data', d => { body += d; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) { log(`plan usage: HTTP ${res.statusCode}`); return resolve(null); }
+        try { resolve(JSON.parse(body)); } catch (_) { resolve(null); }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', (e) => { log(`plan usage: ${e.message}`); resolve(null); });
+  });
+}
+
+function limitText(label, window, format) {
+  if (!window || window.utilization == null) return `${label} n/a`;
+  const pct = Math.round(window.utilization);
+  const dot = pct >= 80 ? '🔴' : pct >= 50 ? '🟡' : '🟢';
+  const resets = Date.parse(window.resets_at);
+  return `${label} ${dot} <b>${pct}%</b>${resets ? ` (resets ${tgTime(resets, format, new Date(resets).toLocaleString('en-GB'))})` : ''}`;
+}
+
+async function motdText(prevStop) {
   const now = Date.now();
   const started = DAEMON_STARTED_AT.getTime();
   // A main task still marked running was cut off by this restart; it is the real last job.
@@ -2163,21 +2220,35 @@ function motdText(prevStop) {
   const launch = process.env.TG_DAEMON_LAUNCH;
   const mode = LAUNCH_MODES[launch] || launch || (process.stdout.isTTY ? LAUNCH_MODES.foreground : 'Background');
   const user = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${os.userInfo().username}` : os.userInfo().username;
-  const session = state.sessionId ? `resumed ${state.sessionId.slice(0, 8)}` : 'fresh';
+  const k = (n) => `${Math.round(n / 1000)}k`;
+  let session;
+  if (state.sessionId) {
+    const ctx = sessionContextTokens(state.sessionId);
+    session = `↩️ Resuming <code>${htmlEscape(state.sessionId.slice(0, 8))}</code>`
+      + (ctx != null ? ` · context <b>${k(ctx)}</b> / ${k(ROTATE_TOKENS)}` : '');
+  } else {
+    session = `🆕 New session${sessionExpiredAtStart ? ' (the last one was idle over 2h)' : ''}`;
+  }
+  const plan = await planUsage();
+  const limits = plan
+    ? `${limitText('5h', plan.five_hour, 't')} | ${limitText('Week', plan.seven_day, 'wt')}`
+    : 'n/a (usage not reachable)';
   return `🟢 <b>Claude bridge online</b>\n\n`
     + `Current Time: ${tgTime(now, 'wDT', new Date(now).toLocaleString('en-GB'))}\n`
     + `Mode: <code>${htmlEscape(mode)}</code> | TimeStart: ${tgTime(started, 't', DAEMON_STARTED_AT.toLocaleTimeString('en-GB'))} | PC: <code>${htmlEscape(os.hostname())}</code>\n`
     + `ActiveUser: <code>${htmlEscape(user)}</code> | LastJobStatus: ${jobText}\n`
-    + `Session: <code>${htmlEscape(session)}</code> | Model: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code> | Queue: <code>${state.queue.length}</code>\n`
+    + `Session: ${session}\n`
+    + `Model: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code> | Queue: <code>${state.queue.length}</code>\n`
+    + `Limits: ${limits}\n`
     + `PrevStop: ${prevStop}`;
 }
 
 // Silent: the daily logon start should not buzz the phone. "motd": false in
 // agent-runtime.json's telegram section turns the banner off.
-function sendMotd(prevStop) {
-  if (TELEGRAM_RUNTIME.motd === false) return Promise.resolve();
-  return tgApi('sendMessage', { chat_id: config.chat_id, parse_mode: 'HTML', text: motdText(prevStop), disable_notification: true })
-    .catch(e => log(`motd: ${e.message}`));
+async function sendMotd(prevStop) {
+  if (TELEGRAM_RUNTIME.motd === false) return;
+  try { await tgApi('sendMessage', { chat_id: config.chat_id, parse_mode: 'HTML', text: await motdText(prevStop), disable_notification: true }); }
+  catch (e) { log(`motd: ${e.message}`); }
 }
 
 // ---------- Hermes queue poller ----------
