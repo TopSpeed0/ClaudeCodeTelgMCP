@@ -24,6 +24,7 @@ const {
 } = require('./telegram-command-router');
 const { resolveQueueModel } = require('./queue-model');
 const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-schedule');
+const { snippet, searchArchive } = require('./archive-search');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
@@ -1642,7 +1643,7 @@ async function telegramCommand(rawText) {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
         + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — read-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating read-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
-        + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
+        + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
         + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
         + 'Reactions: ✍ queued · 👀 working · 🎉 done · 💔 failed. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
@@ -1652,6 +1653,7 @@ async function telegramCommand(rawText) {
       doctor: () => doctorReport(),
       remind: (argument) => scheduleCommand('remind', argument),
       every: (argument) => scheduleCommand('every', argument),
+      search: (argument) => searchView(argument).text,
       status: () => {
         const readiness = mcp();
         return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
@@ -2213,6 +2215,78 @@ async function runScheduled(job) {
   await sendChunked(`${label} · ${job.rule ? describeRule(job.rule) : 'once'}${late}\n\n${trimmed}`, { mode: 'rich', replyTo: job.msgId, buttons });
 }
 
+// ---------- Archive search (/search) ----------
+// Full-text search over every archived turn and daily summary, answered at
+// once without a Claude run. 🧠 Summarize under the result asks Claude, in a
+// throwaway read-only session, what was done according to the matching turns.
+const SEARCH_SHOW = 8;
+const SEARCH_SUMMARY_HITS = 25;
+const SEARCH_SUMMARY_CHARS = 40000;
+let lastSearch = null; // { nonce, query, hits }: what 🧠 Summarize works on
+
+function searchDate(hit) {
+  const opts = { weekday: 'short', day: '2-digit', month: '2-digit', year: '2-digit' };
+  if (hit.kind === 'summary') return new Date(`${hit.day}T12:00:00`).toLocaleDateString('en-GB', opts);
+  const d = new Date(hit.ts);
+  return `${d.toLocaleDateString('en-GB', opts)} ${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+function searchView(query) {
+  if (!String(query || '').trim()) {
+    return { text: 'Usage: <code>/search a1k-prd snapmirror</code>: every word must appear, in any order; <code>"quote"</code> a phrase. Searches every archived message and daily summary.' };
+  }
+  const { terms, hits } = searchArchive(ARCHIVE_DIR, query);
+  if (!hits.length) return { text: `🔎 Nothing in the archive matches <i>${htmlEscape(query)}</i>. Try fewer or shorter words.` };
+  const entries = hits.slice(0, SEARCH_SHOW).map((hit) => {
+    if (hit.kind === 'summary') return `📝 <b>${searchDate(hit)}</b> · daily summary\n${snippet(hit.text, terms)}`;
+    const user = snippet(hit.user, terms) || htmlEscape(shorten(hit.user, 80));
+    const reply = snippet(hit.assistant, terms) || htmlEscape(shorten(hit.assistant, 100));
+    return `📅 <b>${searchDate(hit)}</b>${hit.source ? ` · ${htmlEscape(hit.source)}` : ''}\n👤 ${user}\n🤖 ${reply}`;
+  });
+  lastSearch = { nonce: crypto.randomBytes(4).toString('hex'), query, hits };
+  const more = hits.length > SEARCH_SHOW ? `Showing the newest ${SEARCH_SHOW}. Add words to narrow it, or ` : '';
+  return {
+    text: `🔎 <b>${hits.length} match${hits.length === 1 ? '' : 'es'}</b> for <i>${htmlEscape(query)}</i>, newest first\n\n${entries.join('\n\n')}\n\n`
+      + `${more}${more ? 'tap' : 'Tap'} 🧠 Summarize for what was done${hits.length > SEARCH_SUMMARY_HITS ? ` (newest ${SEARCH_SUMMARY_HITS})` : ''}.`,
+    buttons: [[{ text: '🧠 Summarize', callback_data: `sr:sum:${lastSearch.nonce}`, style: 'primary' }]],
+  };
+}
+
+// A tap on 🧠 Summarize. Only the latest search can be summarized. Returns
+// false when the button was not ours.
+function searchButton(cq) {
+  const [tag, , nonce] = String(cq.data || '').split(':');
+  if (tag !== 'sr') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const live = !!lastSearch && nonce === lastSearch.nonce;
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: live ? '🧠 Summarizing…' : '⌛ Out of date: search again.' }).catch(() => {});
+  tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+    .catch(e => log(`search button: ${e.message}`));
+  if (live) summarizeSearch(lastSearch, cq.message.message_id).catch(e => log(`search summary: ${e.stack || e.message}`));
+  return true;
+}
+
+async function summarizeSearch({ query, hits }, replyTo) {
+  const stopTyping = startTyping();
+  try {
+    // Oldest first; when over the size cap, the oldest go.
+    const blocks = hits.slice(0, SEARCH_SUMMARY_HITS).reverse().map(hit => (hit.kind === 'summary'
+      ? `### ${hit.day} (daily summary)\n${hit.text}`
+      : `### ${hit.ts}${hit.source ? ` (${hit.source})` : ''}\nUser: ${hit.user}\nAssistant: ${hit.assistant}`).slice(0, 4000));
+    const body = blocks.join('\n\n').slice(-SEARCH_SUMMARY_CHARS);
+    const prompt = `The user searched their past Telegram conversations with you for "${query}". From the matching excerpts below (oldest first), `
+      + 'answer briefly: what was done about it and when, what was found or decided, the names, numbers and commands that matter, and what is still open. '
+      + `Short bullets grouped by date, newest first. Markdown, no preamble; answer from the excerpts only.\n\n${body}`;
+    const { code, out } = await claudeRaw(prompt, ['--session-id', crypto.randomUUID()], { nativeMcp: false, permissionMode: 'plan' });
+    let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
+    if (envelope) recordUsage(envelope, CLAUDE_RUNTIME.model, 'search');
+    const text = code === 0 && envelope && typeof envelope.result === 'string' ? envelope.result.trim() : '';
+    await sendChunked(text ? `🧠 **What the archive says about** \`${query.replace(/`/g, "'")}\`\n\n${text}` : '🧠 Could not summarize the search; see the daemon log.', { mode: 'rich', replyTo });
+  } finally {
+    stopTyping();
+  }
+}
+
 function formatQueue() {
   const lines = ['<b>📋 Queue</b>', ''];
   if (currentItem) {
@@ -2352,6 +2426,11 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
       return;
     }
+    if (parsed && parsed.command === 'search') {
+      const view = searchView(parsed.argument);
+      await sendChunked(view.text, { mode: 'html', replyTo: m.message_id, buttons: view.buttons }).catch(e => log(`search reply: ${e.message}`));
+      return;
+    }
     if (parsed && (parsed.command === 'remind' || parsed.command === 'every')) {
       tgReact(m.message_id, '🫡');
       await sendChunked(scheduleCommand(parsed.command, parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`schedule reply: ${e.message}`));
@@ -2410,7 +2489,7 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
-      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }

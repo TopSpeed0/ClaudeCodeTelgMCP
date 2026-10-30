@@ -1,11 +1,12 @@
 'use strict';
 
-const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'progress']);
+const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'search', 'progress']);
 // Answered the moment they arrive, even while a task runs. /bg starts its own
-// isolated session at once; /remind and /every only store a job. Everything else (tasks and state-changing commands
+// isolated session at once; /remind and /every only store a job;
+// /search reads the archive. Everything else (tasks and state-changing commands
 // such as /clear, /refresh, /compact, /model, /retry, /plan) waits its turn in the queue, so it
 // never races the running task.
-const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'progress']);
+const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'search', 'progress']);
 const COMMAND_ALIASES = { new: 'clear' };
 const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Daemon status and runtime' },
@@ -16,6 +17,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'bg', description: 'Side task in its own session, in parallel' },
   { command: 'remind', description: 'Read-only check later: /remind 45m <task> · /remind list' },
   { command: 'every', description: 'Repeating read-only check: /every weekdays 07:30 <task>' },
+  { command: 'search', description: 'Find past conversations in the archive' },
   { command: 'usage', description: 'Cost, turns and time: last task and today' },
   { command: 'doctor', description: 'Health check: Telegram, Claude CLI, MCP, limits, autostart, disk' },
   { command: 'progress', description: 'How much live progress you see: off, quiet, normal, full' },
@@ -29,6 +31,10 @@ const TELEGRAM_COMMANDS = [
   { command: 'help', description: 'Show supported Telegram commands' },
 ];
 const MAX_MENU_COMMANDS = 100; // Telegram's setMyCommands limit
+// Telegram also caps the menu's total text (names + descriptions) with the
+// same BOT_COMMANDS_TOO_MUCH error: undocumented, about 6000 characters when
+// tried in 2026-10. Kept under it with some room.
+const MAX_MENU_CHARS = 5800;
 
 function parseTelegramCommand(rawText) {
   const text = String(rawText || '').trim();
@@ -121,12 +127,23 @@ function buildCommandMenu(skills = [], mcpServers = []) {
   const left = [];
   const add = (entry, command, fallback) => {
     if (commands.length >= MAX_MENU_COMMANDS) { left.push(entry.name); return; }
-    commands.push({ command, description: entry.description || fallback });
+    commands.push({ command, description: entry.description || fallback, name: entry.name });
   };
   const mcpNames = mcpServers.map(server => server.name);
   mcpCommandNames(mcpNames).forEach(({ command }, i) => add(mcpServers[i], command, `🔌 ${mcpServers[i].name} MCP server`));
   skillCommandNames(skills.map(skill => skill.name), mcpNames)
     .forEach(({ command }, i) => add(skills[i], command, `🧩 Run the ${skills[i].name} skill`));
+  // Over the text cap: shorten MCP and skill descriptions step by step, and
+  // only then drop entries from the end.
+  const builtins = TELEGRAM_COMMANDS.length;
+  const size = () => commands.reduce((n, item) => n + item.command.length + item.description.length, 0);
+  for (let cap = 85; size() > MAX_MENU_CHARS && cap >= 25; cap -= 5) {
+    for (let i = builtins; i < commands.length; i++) {
+      const { description } = commands[i];
+      if (description.length > cap) commands[i] = { ...commands[i], description: `${description.slice(0, cap - 1).trimEnd()}…` };
+    }
+  }
+  while (size() > MAX_MENU_CHARS && commands.length > builtins) left.unshift(commands.pop().name);
   return Object.assign(commands, { left });
 }
 

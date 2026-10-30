@@ -54,6 +54,19 @@ test('adds every skill to the menu within Telegram limits', () => {
   for (const item of menu) assert.match(item.command, /^[a-z0-9_]{1,32}$/);
 });
 
+test('keeps the menu under Telegram\'s total text cap by shortening descriptions', () => {
+  const size = (menu) => menu.reduce((n, item) => n + item.command.length + item.description.length, 0);
+  const wordy = Array.from({ length: 70 }, (_, i) => ({ name: `skill-${i}`, description: `🧩 ${'Long description of what this skill does. '.repeat(3)}` }));
+  const menu = buildCommandMenu(wordy);
+  assert.equal(menu.length, TELEGRAM_COMMANDS.length + 70, 'nothing dropped while shortening is enough');
+  assert.ok(size(menu) <= 5800, `size ${size(menu)}`);
+  assert.deepEqual(menu.slice(0, TELEGRAM_COMMANDS.length), TELEGRAM_COMMANDS, 'built-in descriptions untouched');
+  assert.match(menu[menu.length - 1].description, /…$/);
+  const huge = buildCommandMenu(Array.from({ length: 79 }, (_, i) => ({ name: `a-very-long-skill-name-number-${i}`, description: `🧩 ${'x'.repeat(90)}` })));
+  assert.ok(size(huge) <= 5800, `size ${size(huge)}`);
+  assert.equal(huge.length + huge.left.length, TELEGRAM_COMMANDS.length + 79, 'what does not fit is reported in left');
+});
+
 test('lists MCP servers by their own names, before skills', async () => {
   const mcp = [{ name: 'storage', description: '🔌 MCP · 11 tools' }, { name: 'hypervisor_lab', description: '🔌 MCP · 25 tools' }];
   const menu = buildCommandMenu([{ name: 'storage', description: '🧩 a skill named storage' }, { name: 'net-audit' }], mcp);
@@ -96,12 +109,12 @@ test('routes /refresh to its own handler, not to clear', async () => {
 });
 
 test('answers control commands immediately and queues the rest', () => {
-  for (const text of ['/stop', '/stop all', '/queue', '/status', '/usage@my_bot', '/doctor', '/bg check disks', '/remind 45m check', '/every list', '/progress quiet']) assert.equal(isImmediateCommand(text), true, text);
+  for (const text of ['/stop', '/stop all', '/queue', '/status', '/usage@my_bot', '/doctor', '/bg check disks', '/remind 45m check', '/every list', '/search a1k-prd', '/progress quiet']) assert.equal(isImmediateCommand(text), true, text);
   for (const text of ['/clear', '/new', '/refresh', '/compact', '/model x', '/retry', '/plan fix it', '/team-vm-manager', 'stop']) assert.equal(isImmediateCommand(text), false, text);
 });
 
 test('publishes the exact local Telegram command menu', () => {
-  assert.deepEqual(TELEGRAM_COMMANDS.map(item => item.command), ['status', 'stop', 'queue', 'retry', 'plan', 'bg', 'remind', 'every', 'usage', 'doctor', 'progress', 'compact', 'refresh', 'new', 'model', 'mcp', 'skills', 'clear', 'help']);
+  assert.deepEqual(TELEGRAM_COMMANDS.map(item => item.command), ['status', 'stop', 'queue', 'retry', 'plan', 'bg', 'remind', 'every', 'search', 'usage', 'doctor', 'progress', 'compact', 'refresh', 'new', 'model', 'mcp', 'skills', 'clear', 'help']);
   for (const item of TELEGRAM_COMMANDS) {
     assert.match(item.command, /^[a-z0-9_]{1,32}$/);
     assert.ok(item.description.length > 0 && item.description.length <= 256);
