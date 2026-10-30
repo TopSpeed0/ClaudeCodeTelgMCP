@@ -85,6 +85,11 @@ $logFile = Join-Path $PSScriptRoot 'task-daemon.log'
 # Match by command line so we only touch *our* node process, not unrelated Node apps.
 $existing = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+if ($existing) {
+  # A killed daemon looks the same as a crashed one; this marker lets the new
+  # daemon's startup banner report the stop as a deliberate restart.
+  Set-Content -Path (Join-Path $repo '.telegram-task-daemon.restart') -Value ([DateTimeOffset]::Now.ToUnixTimeMilliseconds())
+}
 foreach ($p in $existing) {
   Write-Host "Stopping previous daemon (PID=$($p.ProcessId), started $($p.CreationDate))"
   Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
@@ -125,6 +130,9 @@ $env:TELEGRAM_CHAT_ID   = $tg.TELEGRAM_CHAT_ID
 # Generate the daemon MCP config from this repo's private connector registry.
 & node (Join-Path $PSScriptRoot 'sync-mcp-connectors.js') claude
 if ($LASTEXITCODE -ne 0) { throw "MCP connector sync failed" }
+
+# Shown as "Mode" in the daemon's startup banner.
+$env:TG_DAEMON_LAUNCH = if ($IfNotRunning) { 'auto' } elseif ($Background) { 'manual' } else { 'foreground' }
 
 Write-Host "Starting task daemon (chat_id=$($tg.TELEGRAM_CHAT_ID))"
 Write-Host "Workspace: $repo"

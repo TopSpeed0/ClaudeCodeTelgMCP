@@ -14,6 +14,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const https = require('https');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
@@ -1728,16 +1729,19 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
 
   if (!ok && result === '__STOPPED__') {
     log(`task stopped by /stop after ${dt}s`);
+    recordJob('stopped');
     await tgClearReaction(msgId);
     await sendChunked(`⏹ <b>Stopped</b> after ${dt}s.`, { mode: 'html', replyTo: msgId });
     return;
   }
   if (!ok) {
+    recordJob('failed');
     await tgReact(msgId, '💔');
     await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich', replyTo: msgId });
     return;
   }
 
+  recordJob('success');
   const trimmed = stripAnsi(result || '').trim();
 
   // Archive the turn with the REAL reply (recover from transcript when tg_send was used).
@@ -1786,6 +1790,7 @@ async function recoverInterrupted() {
   for (const [msgId, task] of entries) {
     const id = Number(msgId);
     log(`recovery: task ${id} (${task.kind}) was interrupted by a restart`);
+    if (task.kind === 'main') recordJob('interrupted', task.startedAt);
     await tgClearReaction(id);
     if (task.statusMessageId) await tgApi('deleteMessage', { chat_id: config.chat_id, message_id: task.statusMessageId }).catch(() => {});
     const again = task.kind === 'bg'
@@ -2104,6 +2109,7 @@ function setPresence(online) {
 
 async function shutdown(signal) {
   log(`${signal}, exiting`);
+  state.cleanStopAt = Date.now(); saveState();
   if (warm) killTree(warm.proc);
   await Promise.race([setPresence(false), new Promise(r => setTimeout(r, 3000))]);
   releaseLock();
@@ -2113,6 +2119,66 @@ async function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('exit', releaseLock);
+
+// ---------- Startup banner ----------
+// One message per daemon start, so a restart is visible in the chat along with
+// why the previous run ended. A hard kill never runs shutdown(), so the cause is
+// found by elimination: the launcher leaves a marker before it kills, a clean
+// exit records cleanStopAt, a reboot shows in the boot time, and anything else
+// (crash, Task Manager, a parent app taking it down) was unexpected.
+const RESTART_MARKER = path.join(WORKDIR, '.telegram-task-daemon.restart');
+const HEARTBEAT_MS = 60 * 1000;
+const LAUNCH_MODES = { auto: 'Auto (scheduled task)', manual: 'Manual (shortcut)', foreground: 'Foreground (terminal)' };
+
+function heartbeat() { state.aliveAt = Date.now(); saveState(); }
+
+function recordJob(status, at = Date.now()) {
+  state.lastJob = { status, at };
+  saveState();
+}
+
+// Must run before the first heartbeat overwrites aliveAt.
+function previousStop() {
+  let marker = 0;
+  try { marker = Number(fs.readFileSync(RESTART_MARKER, 'utf-8').trim()) || 0; fs.unlinkSync(RESTART_MARKER); } catch (_) {}
+  const { cleanStopAt: clean, aliveAt: alive } = state;
+  state.cleanStopAt = null;
+  if (clean) return `✅ Clean stop ${tgTime(clean, 'r', 'earlier')}`;
+  if (!alive) return '🆕 First start';
+  if (marker >= alive - HEARTBEAT_MS) return '🔁 Restarted by the launcher';
+  const seen = tgTime(alive, 't', new Date(alive).toLocaleTimeString('en-GB'));
+  if (Date.now() - os.uptime() * 1000 > alive) return `💤 PC restarted (last seen ${seen})`;
+  return `⚠️ Unexpected stop, last seen ${seen} (killed or crashed)`;
+}
+
+function motdText(prevStop) {
+  const now = Date.now();
+  const started = DAEMON_STARTED_AT.getTime();
+  // A main task still marked running was cut off by this restart; it is the real last job.
+  const cut = Object.values(state.running || {}).find(t => t.kind === 'main');
+  const job = cut ? { status: 'interrupted', at: cut.startedAt } : state.lastJob;
+  const jobText = job
+    ? `${{ success: '✅ Success', failed: '❌ Failed', stopped: '⏹ Stopped', interrupted: '⚠️ Interrupted' }[job.status] || job.status} ${tgTime(job.at, 'r', 'earlier')}`
+    : 'none yet';
+  const launch = process.env.TG_DAEMON_LAUNCH;
+  const mode = LAUNCH_MODES[launch] || launch || (process.stdout.isTTY ? LAUNCH_MODES.foreground : 'Background');
+  const user = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${os.userInfo().username}` : os.userInfo().username;
+  const session = state.sessionId ? `resumed ${state.sessionId.slice(0, 8)}` : 'fresh';
+  return `🟢 <b>Claude bridge online</b>\n\n`
+    + `Current Time: ${tgTime(now, 'wDT', new Date(now).toLocaleString('en-GB'))}\n`
+    + `Mode: <code>${htmlEscape(mode)}</code> | TimeStart: ${tgTime(started, 't', DAEMON_STARTED_AT.toLocaleTimeString('en-GB'))} | PC: <code>${htmlEscape(os.hostname())}</code>\n`
+    + `ActiveUser: <code>${htmlEscape(user)}</code> | LastJobStatus: ${jobText}\n`
+    + `Session: <code>${htmlEscape(session)}</code> | Model: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code> | Queue: <code>${state.queue.length}</code>\n`
+    + `PrevStop: ${prevStop}`;
+}
+
+// Silent: the daily logon start should not buzz the phone. "motd": false in
+// agent-runtime.json's telegram section turns the banner off.
+function sendMotd(prevStop) {
+  if (TELEGRAM_RUNTIME.motd === false) return Promise.resolve();
+  return tgApi('sendMessage', { chat_id: config.chat_id, parse_mode: 'HTML', text: motdText(prevStop), disable_notification: true })
+    .catch(e => log(`motd: ${e.message}`));
+}
 
 // ---------- Hermes queue poller ----------
 const HERMES_QUEUE = path.join(WORKDIR, '.claude-queue.json');
@@ -2166,6 +2232,9 @@ async function hermesQueuePoll() {
 }
 
 acquireLock();
+const prevStop = previousStop();
+heartbeat();
+setInterval(heartbeat, HEARTBEAT_MS);
 writeDaemonSettings();
 registerTelegramCommandMenu()
   .then(() => refreshMcpCatalog())
@@ -2175,7 +2244,8 @@ setPresence(true);
 setInterval(() => setPresence(true), PRESENCE_EVERY_MS);
 setInterval(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)), OUTBOX_RETRY_MS);
 maybeRotate({ notify: false });
-recoverInterrupted()
+sendMotd(prevStop)
+  .then(() => recoverInterrupted())
   .catch(e => log(`recovery: ${e.message}`))
   .then(() => prewarm())
   .then(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)));
