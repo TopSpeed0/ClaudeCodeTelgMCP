@@ -27,6 +27,7 @@ const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-s
 const { snippet, searchArchive } = require('./archive-search');
 const { fill, pick, readAlerts, diffAlerts, muteKey, titleIgnored } = require('./sentry-alerts');
 const { maskSecrets } = require('./secret-mask');
+const { noteMessage, sessionOfMessage } = require('./message-sessions');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
@@ -335,7 +336,9 @@ const CONFETTI_AFTER_MS = 2 * 60 * 1000;
 // after the client's retries, the undelivered rest goes to the outbox (or to
 // onUnsent, when the outbox itself is resending) and false is returned.
 // buttons: extra inline-keyboard rows for the last chunk, under any Copy buttons.
-async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, buttons } = {}) {
+// session: the Claude conversation that wrote this answer, remembered per
+// message so a later reply to it can continue there (reply-to-resume).
+async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, buttons, session } = {}) {
   // Telegram caps messages at 4096 chars. We leave headroom for the <pre>...</pre> wrapper.
   const MAX = 3800;
   let remaining = stripAnsi(text || '(no output)');
@@ -384,14 +387,16 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
     const payload = { chat_id: config.chat_id, text: body, parse_mode, reply_parameters, reply_markup, message_effect_id: effectId, disable_web_page_preview: true };
     try {
       try {
-        await tgApi('sendMessage', payload);
+        const sent = await tgApi('sendMessage', payload);
+        if (session && sent) noteMessage({ bot: sent.message_id, session });
       } catch (e) {
         // Formatting Telegram rejected (unbalanced tags from a half-baked
         // Markdown conversion, etc.): resend this chunk as plain text. Any
         // other error is a delivery problem, handled below.
         if (!e.isParseError) throw e;
         log(`sendMessage HTML rejected (${e.message}) — resending plain`);
-        await tgApi('sendMessage', { ...payload, text: chunk, parse_mode: undefined });
+        const sent = await tgApi('sendMessage', { ...payload, text: chunk, parse_mode: undefined });
+        if (session && sent) noteMessage({ bot: sent.message_id, session });
       }
     } catch (e) {
       log(`sendMessage failed after retries (${e.message}) — keeping the rest for later`);
@@ -915,7 +920,10 @@ async function maybeRotate({ notify = true } = {}) {
 // or for an explicit recall). Returns { ok, text, code, forked, actualId }.
 // source labels /usage; permissionMode and onEvent pass through to claudeRaw.
 // onSpawn defaults to registering the main /stop target.
-async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false, replyTo, permissionMode, onEvent, onSpawn, source } = {}) {
+// forkFrom: continue an earlier conversation as a copy (--fork-session); it
+// runs isolated, so the pinned conversation is not touched.
+async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false, replyTo, permissionMode, onEvent, onSpawn, source, forkFrom } = {}) {
+  if (forkFrom) isolated = true;
   const resuming = !isolated && !!state.sessionId;
   const useWarm = WARM_ENABLED && !isolated && !permissionMode;
   // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
@@ -923,10 +931,10 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
   const sessionId = isolated ? crypto.randomUUID()
     : (state.sessionId || (useWarm && warm && !warm.used ? warm.sessionId : crypto.randomUUID()));
   const prompt = contextPrefix ? `${contextPrefix}\n\n---\nThe user's actual message:\n${task}` : task;
-  const sessionArgs = resuming ? ['--resume', sessionId] : ['--session-id', sessionId];
+  const sessionArgs = forkFrom ? ['--resume', forkFrom, '--fork-session'] : resuming ? ['--resume', sessionId] : ['--session-id', sessionId];
   // Opt-in Claude in Chrome tools for task sessions (not summaries); needs the extension connected.
   if (CLAUDE_RUNTIME.chrome === true) sessionArgs.push('--chrome');
-  log(resuming ? `resuming session ${sessionId}` : `starting fresh session ${sessionId}`);
+  log(forkFrom ? `forking session ${forkFrom}` : resuming ? `resuming session ${sessionId}` : `starting fresh session ${sessionId}`);
 
   let mainHandle = null;
   const register = onSpawn || ((handle) => { mainHandle = handle; activeTask = handle; });
@@ -1649,6 +1657,7 @@ async function telegramCommand(rawText) {
         + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/approvals — latest approval decisions and your Always rules · <code>/approvals revoke &lt;n&gt;</code>\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
+        + '↩️ Reply to an older answer (or a side task\'s) to continue in that conversation; 📌 makes it the main chat.\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
         + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
         + 'Reactions: ✍ queued · 👀 working · 🎉 done · 💔 failed. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
@@ -1839,11 +1848,13 @@ async function handleMessage(item) {
   saveState();
   await rolloverIfNewDay();
   const stopTyping = startTyping();
+  const fork = item.resumeFrom && !permissionMode ? item.resumeFrom : null;
   const status = startStatus(msgId, permissionMode === 'plan'
     ? { title: 'Planning (read-only)' }
-    : { title: 'Working', workingReaction: '👨‍💻' });
+    : { title: fork ? 'Continuing an earlier conversation' : 'Working', workingReaction: '👨‍💻' });
   try {
-    await runTask(rawText, msgId, Date.now(), { permissionMode, status });
+    if (fork) await runForkTask(rawText, msgId, Date.now(), fork, status);
+    else await runTask(rawText, msgId, Date.now(), { permissionMode, status });
   } finally {
     stopTyping();
     status.stop();
@@ -1915,6 +1926,8 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
     replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
   }
   appendArchive({ day: state.day, ts: new Date().toISOString(), user: permissionMode === 'plan' ? `/plan ${rawText}` : rawText, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
+  const session = actualId || state.sessionId;
+  noteMessage({ task: msgId, session });
 
   // A plan ends with ▶️ Execute / ❌ Dismiss buttons.
   let buttons;
@@ -1931,15 +1944,84 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
   // including the usual one where the agent already answered through tg_send.
   if (TG_SENT_SENTINEL.test(trimmed) || !trimmed) {
     log(`relay suppressed: ${trimmed ? 'agent used tg_send sentinel' : 'empty stdout'} (${dt}s, stdout=${trimmed.length} chars)`);
-    if (buttons) await sendChunked('🧪 <b>Plan ready</b> (read-only, nothing was changed).', { mode: 'html', replyTo: msgId, buttons });
+    if (buttons) await sendChunked('🧪 <b>Plan ready</b> (read-only, nothing was changed).', { mode: 'html', replyTo: msgId, buttons, session });
   } else {
     // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
     // with the looksTabular() <pre> fallback inside sendChunked.
     const header = permissionMode === 'plan' ? '🧪 **Plan (read-only, nothing was changed).** Tap *Execute* to carry it out, or reply with changes.\n\n' : '';
-    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId, buttons, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
+    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId, buttons, session, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
   }
   await tgReact(msgId, '🎉');
   await maybeRotate();
+}
+
+// ---------- Reply-to-resume ----------
+// A reply to an answer from another conversation (an older main chat, a /bg
+// or scheduled run, an Investigate) continues in that conversation, as a fork
+// (--fork-session): the earlier conversation and the main chat stay as they
+// are. 📌 under the answer makes the fork the main chat.
+function conversationLabel(ts) {
+  const when = ts ? new Date(ts) : null;
+  if (!when || Number.isNaN(when.getTime())) return 'an earlier conversation';
+  return `the ${when.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: '2-digit' })} ${when.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} conversation`;
+}
+
+async function runForkTask(rawText, msgId, t0, from, status) {
+  const task = '[The user replied to one of your answers from an earlier conversation, so this message continues that conversation '
+    + `(as a copy: the main Telegram conversation is separate).]\n\n${rawText}`;
+  const { ok, text: result, code, actualId } = await runClaude(task, {
+    forkFrom: from.session, replyTo: msgId, source: 'fork', onEvent: status ? (ev) => status.step(ev) : undefined,
+  });
+  const dt = ((Date.now() - t0) / 1000).toFixed(1);
+  if (!ok && result === '__STOPPED__') {
+    recordJob('stopped');
+    await tgClearReaction(msgId);
+    await sendChunked(`⏹ <b>Stopped</b> after ${dt}s.`, { mode: 'html', replyTo: msgId });
+    return;
+  }
+  if (!ok && /no conversation found|session .*(not found|invalid|expired)|could not (resume|find)|unable to resume/i.test(result || '')) {
+    // Its transcript is gone (cleaned up, another PC): answer in the main chat instead.
+    log(`fork: session ${from.session} could not be reopened — answering in the main chat`);
+    await sendChunked('↩️ That earlier conversation could not be reopened, so this continues in the main chat.', { mode: 'rich', replyTo: msgId });
+    return runTask(rawText, msgId, t0, { status });
+  }
+  if (!ok) {
+    recordJob('failed');
+    await tgReact(msgId, '💔');
+    await sendChunked(`**Failed** (exit=${code}, ${dt}s):\n${stripAnsi(result || '').trim() || '(no output)'}`, { mode: 'rich', replyTo: msgId });
+    return;
+  }
+  recordJob('success');
+  noteMessage({ task: msgId, session: actualId });
+  const trimmed = stripAnsi(result || '').trim();
+  let replyForArchive = trimmed;
+  if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
+  appendArchive({ day: state.day || localDayKey(), ts: new Date().toISOString(), source: 'fork', user: rawText, assistant: replyForArchive, sessionId: actualId, forkedFrom: from.session });
+  const buttons = actualId ? [[{ text: '📌 Make this the main chat', callback_data: `rs:main:${actualId}` }]] : undefined;
+  const header = `↩️ _Continued from ${conversationLabel(from.ts)}._`;
+  if (!trimmed || TG_SENT_SENTINEL.test(trimmed)) await sendChunked(header, { mode: 'rich', replyTo: msgId, buttons, session: actualId });
+  else await sendChunked(`${header}\n\n${trimmed}`, { mode: 'rich', replyTo: msgId, buttons, session: actualId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
+  await tgReact(msgId, '🎉');
+}
+
+// 📌 Make this the main chat. Returns false when the button was not ours.
+function resumeButton(cq) {
+  const [tag, action, id] = String(cq.data || '').split(':');
+  if (tag !== 'rs') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cq.id, text }).catch(() => {});
+  if (action !== 'main' || !id) return true;
+  if (busy) { answer('A task is running; tap again when it is done.'); return true; }
+  closeWarm('switching the main chat');
+  state.sessionId = id;
+  state.lastActivity = new Date().toISOString();
+  state.planNonce = null;
+  saveState();
+  log(`main chat switched to session ${id}`);
+  answer('📌 This is now the main chat: your next message continues it.');
+  tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+    .catch(e => log(`resume button: ${e.message}`));
+  return true;
 }
 
 // ---------- Restart recovery ----------
@@ -2066,8 +2148,9 @@ async function runBgTask(entry, msgId) {
     let replyForArchive = trimmed;
     if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
     appendArchive({ day: state.day || localDayKey(), ts: new Date().toISOString(), source: 'bg', user: `/bg ${entry.text}`, assistant: replyForArchive, sessionId: actualId });
+    noteMessage({ task: msgId, session: actualId });
     if (trimmed && !TG_SENT_SENTINEL.test(trimmed)) {
-      await sendChunked(`⚡ **Side task done** (${dt}s)\n\n${trimmed}`, { mode: 'rich', replyTo: msgId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
+      await sendChunked(`⚡ **Side task done** (${dt}s)\n\n${trimmed}`, { mode: 'rich', replyTo: msgId, session: actualId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
     }
     await tgReact(msgId, '🎉');
   } finally {
@@ -2223,7 +2306,7 @@ async function runScheduled(job) {
     { text: '⏸ Pause', callback_data: `sj:pause:${job.id}` },
     { text: '🗑 Delete', callback_data: `sj:del:${job.id}`, style: 'danger' },
   ]] : undefined;
-  await sendChunked(`${label} · ${job.rule ? describeRule(job.rule) : 'once'}${late}\n\n${trimmed}`, { mode: 'rich', replyTo: job.msgId, buttons });
+  await sendChunked(`${label} · ${job.rule ? describeRule(job.rule) : 'once'}${late}\n\n${trimmed}`, { mode: 'rich', replyTo: job.msgId, buttons, session: actualId });
 }
 
 // ---------- Approvals (/approvals) ----------
@@ -2842,7 +2925,11 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
     }
   }
   const media = ownMedia || repliedMedia;
-  const item = { text, msgId: m.message_id, media: media ? [media] : undefined, context: replyContext(m) || undefined };
+  // A reply to a bot answer from another conversation continues there (see runForkTask).
+  const replied = m.reply_to_message;
+  const earlier = replied && replied.from && replied.from.is_bot ? sessionOfMessage(replied.message_id) : null;
+  const resumeFrom = earlier && earlier.session !== state.sessionId ? earlier : undefined;
+  const item = { text, msgId: m.message_id, media: media ? [media] : undefined, context: replyContext(m) || undefined, resumeFrom };
   if (ownMedia && m.media_group_id) return bufferAlbum(m.media_group_id, item);
   if (!media && !parsed && !item.context) return bufferPaste(item);
   enqueue(item);
@@ -2878,7 +2965,7 @@ async function pollLoop() {
       else if (u.callback_query && !fromOwner(u.callback_query.from)) {
         tgApi('answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Only the bot owner can use these buttons.' }).catch(() => {});
         log(`ignored button tap from user ${u.callback_query.from && u.callback_query.from.id}`);
-      } else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      } else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query) && !resumeButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }

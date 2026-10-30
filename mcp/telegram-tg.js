@@ -97,6 +97,7 @@ function pickFileMethod(filePath) {
 // Handshake with telegram-task-daemon.js: while tg_ask waits it owns getUpdates
 // and the daemon pauses; see telegram-handshake.js.
 const { setAskFlag, takeHandoff, forwardToDaemon, currentTaskReplyTo } = require('./telegram-handshake');
+const { noteMessage } = require('./message-sessions');
 
 // The Telegram message the daemon's current task answers: from the
 // environment (a Claude process started for one task) or from the daemon's
@@ -106,6 +107,11 @@ const { setAskFlag, takeHandoff, forwardToDaemon, currentTaskReplyTo } = require
 const ENV_REPLY_TO = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
 const UNDER_DAEMON = Boolean(ENV_REPLY_TO || process.env.TELEGRAM_UNDER_DAEMON);
 function taskReplyTo() { return ENV_REPLY_TO || (UNDER_DAEMON ? currentTaskReplyTo() : null); }
+// A message sent while answering a daemon task: remember which task, so a
+// later reply to it can continue in the conversation that wrote it.
+function noteAnswer(msg, task, chatId) {
+  if (msg && msg.message_id && task != null && String(chatId) === String(config.chat_id)) noteMessage({ bot: msg.message_id, task });
+}
 let threadedTask = null; // the task whose first tg_send is already threaded
 
 // Tracks the most recent inbound message id so tg_react can default to it.
@@ -180,6 +186,7 @@ async function tgSend(text, parseMode, opts = {}) {
     if (keyboard) fields.reply_markup = keyboard;
     const msg = await tgApiMultipart(method, fields, field, opts.file_path, { httpTimeoutMs: 120000 });
     if (replyTo) threadedTask = replyTo.message_id;
+    noteAnswer(msg, task, chatId);
     return `Sent file via ${method} (message_id=${msg.message_id}).`;
   }
 
@@ -207,6 +214,7 @@ async function tgSend(text, parseMode, opts = {}) {
     }
   }
   if (replyTo) threadedTask = replyTo.message_id;
+  noteAnswer(msg, task, chatId);
   return `Sent (message_id=${msg.message_id}${pm ? `, parse_mode=${pm}` : ''}).`;
 }
 
@@ -222,6 +230,7 @@ async function sendAsPage(text, pm, chatId, opts, replyTo) {
     if (replyTo) fields.reply_parameters = replyTo;
     const msg = await tgApiMultipart('sendDocument', fields, 'document', file, { httpTimeoutMs: 120000 });
     if (replyTo) threadedTask = replyTo.message_id;
+    noteAnswer(msg, taskReplyTo(), chatId);
     return `Text was over Telegram's 4096-char limit, so it was sent as an HTML page (message_id=${msg.message_id}). Next time keep messages shorter or put details in <blockquote expandable>.`;
   } finally {
     try { fs.unlinkSync(file); } catch (_) {}
