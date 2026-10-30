@@ -792,6 +792,18 @@ async function compactConversation() {
   const sessionId = state.sessionId;
   if (!sessionId) return 'Nothing to compact: the next message starts a new conversation.';
   const before = sessionContextTokens(sessionId);
+  const k = (n) => `${Math.round(n / 1000)}k`;
+  // Compaction takes up to a minute; show it started, then turn this note into
+  // the result. Returning null tells the command caller there is nothing to send.
+  const note = await tgApi('sendMessage', {
+    chat_id: config.chat_id, parse_mode: 'HTML', disable_notification: true,
+    text: `🗜 <b>Compacting</b> this conversation${before != null ? ` (${k(before)} tokens)` : ''}… usually under a minute.`,
+  }).catch((e) => { log(`compact note: ${e.message}`); return null; });
+  const finish = async (text) => {
+    if (!note || !note.message_id) return text;
+    try { await tgApi('editMessageText', { chat_id: config.chat_id, message_id: note.message_id, parse_mode: 'HTML', text }); return null; }
+    catch (e) { log(`compact note: ${e.message}`); return text; }
+  };
   const w = warm;
   closeWarm('/compact');
   if (w && w.proc.exitCode == null) await Promise.race([new Promise(r => w.proc.once('exit', r)), new Promise(r => setTimeout(r, 6000))]);
@@ -803,14 +815,13 @@ async function compactConversation() {
   let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
   if (code !== 0 || !envelope || envelope.is_error || envelope.local_command !== 'compact') {
     log(`compact failed (exit=${code}): ${String(out).slice(0, 300)}`);
-    return '⚠️ Compaction did not run. The conversation is unchanged; /refresh starts fresh with a summary instead.';
+    return finish('⚠️ Compaction did not run. The conversation is unchanged; /refresh starts fresh with a summary instead.');
   }
   state.lastActivity = new Date().toISOString();
   saveState();
   const after = sessionContextTokens(sessionId);
-  const k = (n) => `${Math.round(n / 1000)}k`;
   log(`compacted session ${sessionId}: ${before} -> ${after} tokens`);
-  return `🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.`;
+  return finish(`🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.`);
 }
 
 function maybeRotate({ notify = true } = {}) {
@@ -1689,7 +1700,7 @@ async function handleMessage(item) {
     permissionMode = 'plan';
   } else if (!item.media) {
     const command = await telegramCommand(rawText);
-    if (command.handled) { await sendChunked(command.reply, { mode: 'html', replyTo: msgId }); return; }
+    if (command.handled) { if (command.reply) await sendChunked(command.reply, { mode: 'html', replyTo: msgId }); return; }
     if (command.skillCommand) rawText = skillTask(command.skillCommand, command.argument);
     if (command.mcpServer) rawText = `Use the "${command.mcpServer}" MCP server's tools (mcp__${command.mcpServer}__*) for this request, in preference to other tools: ${command.argument}`;
   }
