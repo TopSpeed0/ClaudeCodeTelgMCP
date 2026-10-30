@@ -30,7 +30,7 @@ const { maskSecrets } = require('./secret-mask');
 const { noteMessage, sessionOfMessage } = require('./message-sessions');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
-const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
+const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
@@ -245,8 +245,8 @@ function htmlEscape(s) {
 // when the agent forgets to use tg_send, its plain stdout still renders as
 // rich formatting instead of an ugly <pre> monospace block.
 //
-// Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists.
-// Out of scope: tables, links, images, Markdown blockquotes.
+// Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists, tables.
+// Out of scope: links, images, Markdown blockquotes.
 const TELEGRAM_TAG = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|tg-spoiler|blockquote)>|<blockquote expandable>|<a href="[^"<>]*">|<\/a>|<tg-time\b[^<>]*>|<\/tg-time>/gi;
 function markdownToTelegramHTML(text) {
   // Stash fenced code blocks first so their contents are immune to subsequent
@@ -256,6 +256,11 @@ function markdownToTelegramHTML(text) {
     codeBlocks.push(body.replace(/\n+$/, ''));
     return `\u0000CB${codeBlocks.length - 1}\u0000`;
   });
+
+  // Markdown tables (Telegram has none): rendered whole by extractTables and
+  // stashed the same way.
+  const tables = extractTables(html, (i) => `\u0000TB${i}\u0000`);
+  html = tables.text;
 
   // Same trick for inline code spans.
   const inlineCodes = [];
@@ -308,6 +313,8 @@ function markdownToTelegramHTML(text) {
     return body.split('\n').length > 12 ? `<blockquote expandable>${pre}</blockquote>` : pre;
   });
 
+  html = html.replace(/\u0000TB(\d+)\u0000/g, (_m, i) => tables.tables[Number(i)]);
+
   return html.trim();
 }
 
@@ -329,6 +336,9 @@ function looksTabular(text) {
 // Tasks at least this long get 🎉 confetti on the answer the daemon relays.
 const EFFECT_CONFETTI = MESSAGE_EFFECTS.confetti;
 const CONFETTI_AFTER_MS = 2 * 60 * 1000;
+// Answers with a Markdown table are sent as rich messages (real tables); off with telegram.rich_tables: false.
+const RICH_TABLES = TELEGRAM_RUNTIME.rich_tables !== false;
+const hasTelegramTags = (text) => { TELEGRAM_TAG.lastIndex = 0; const found = TELEGRAM_TAG.test(text); TELEGRAM_TAG.lastIndex = 0; return found; };
 
 // effect: a message effect id played on the first chunk. Short fenced code
 // blocks in a 'rich' answer become one-tap Copy buttons on the last chunk.
@@ -346,6 +356,29 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
   if (buttons && buttons.length) copyMarkup = { inline_keyboard: [...((copyMarkup && copyMarkup.inline_keyboard) || []), ...buttons] };
   let effectId = effect;
   const threadUnder = replyTo;
+
+  // An answer with a Markdown table goes out whole as a rich message
+  // (sendRichMessage): Telegram draws real tables, headings and lists from the
+  // Markdown itself. Text with Telegram HTML tags in it, text over the rich
+  // limit, or a refusal takes the usual HTML path below instead.
+  if (mode === 'rich' && RICH_TABLES && remaining.length <= RICH_LIMIT && !hasTelegramTags(remaining)
+      && extractTables(remaining, () => '').tables.length) {
+    try {
+      const sent = await tgApi('sendRichMessage', {
+        chat_id: config.chat_id,
+        rich_message: { markdown: richMarkdown(remaining) },
+        link_preview_options: { is_disabled: true },
+        reply_parameters: replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
+        reply_markup: copyMarkup,
+        message_effect_id: effectId,
+      });
+      if (session && sent) noteMessage({ bot: sent.message_id, session });
+      return true;
+    } catch (e) {
+      log(`rich message refused (${e.message}) — sending as HTML`);
+    }
+  }
+
   let attachFull = null;
   if (remaining.length > MAX * 2) {
     attachFull = remaining;
@@ -566,6 +599,7 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, rep
                   '--settings', DAEMON_SETTINGS];
     if (!nativeMcp) args.push('--strict-mcp-config');
     if (onEvent) args.push('--verbose'); // stream-json in print mode requires it
+    if (onEvent && STREAM) args.push('--include-partial-messages'); // text as it is written, for the live draft
     // Bypass would override plan mode, so a read-only run must not skip checks.
     if (permissionMode) args.push('--permission-mode', permissionMode);
     else args.push('--dangerously-skip-permissions');
@@ -689,7 +723,7 @@ const WARM_IDLE_MS = 30 * 60 * 1000;
 let warm = null; // { proc, sessionId, model, buf, turn, lastCost, errOut, used, idleTimer }
 
 function startWarm(sessionId, resuming, model) {
-  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...(STREAM ? ['--include-partial-messages'] : []),
     '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--dangerously-skip-permissions'];
   if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
   if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
@@ -1221,6 +1255,117 @@ function startStatus(replyTo, { title = 'Working', workingReaction } = {}) {
       if (messageId != null) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: messageId }).catch(e => log(`status delete: ${e.message}`));
     },
   };
+}
+
+// ---------- Live answer draft ----------
+// In a private chat the running task streams into a draft bubble
+// (sendMessageDraft) instead of the status message: the time and steps, then
+// the text as Claude writes it (--include-partial-messages), with Telegram's
+// ⏹ Stop button. A draft is a 30-second preview, so it is refreshed while the
+// task runs; the final answer, sent as a normal message, replaces it, and
+// nothing of the stream stays in the chat. The streamed text is shown plain,
+// with Markdown symbols tidied away (previewText): formatting half-written
+// Markdown is what leaves raw tables and cut syntax behind; the final
+// answer is formatted once, complete. /progress sets how many steps show
+// (none when off). Off with telegram.stream: false. One draft at a time:
+// side tasks keep the status message.
+const STREAM = TELEGRAM_RUNTIME.stream !== false && Number(config.chat_id) > 0;
+const DRAFT_MIN_GAP_MS = 1200;   // Telegram rate-limits edits; at most one update per this
+const DRAFT_KEEPALIVE_MS = 20000; // well inside the 30-second preview life
+const DRAFT_MAX_TEXT = 3000;      // the tail of a long text, inside the 4096 limit
+const drafts = new Map(); // draft_id → what ⏹ Stop does for that task
+
+const useDraft = () => STREAM;
+
+// Half-written Markdown made readable as plain text: no **, `, #, fences
+// or table rules; bullets as •, table rows as cells joined by ·.
+function previewText(markdown) {
+  return String(markdown)
+    .split('\n')
+    .filter(line => !/^\s*```/.test(line) && !/^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(line))
+    .map(line => line
+      .replace(/^\s*#{1,6}\s+/, '')
+      .replace(/^(\s*)[-*]\s+/, '$1• ')
+      .replace(/^\s*\|(.*?)\|?\s*$/, (_m, row) => row.split('|').map(cell => cell.trim()).filter(Boolean).join('  ·  '))
+      .replace(/\*\*|__|`+/g, ''))
+    .join('\n');
+}
+
+function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}) {
+  const draftId = crypto.randomInt(1, 2 ** 31 - 1);
+  const t0 = Date.now();
+  const mode = PROGRESS_MODES[progressMode()];
+  const steps = [];
+  let count = 0, text = '', stopped = false, failed = false, lastAt = 0, timer = null, updates = 0, streamed = 0;
+  const render = () => {
+    const secs = Math.floor((Date.now() - t0) / 1000);
+    const writing = text.trim() !== '';
+    const head = `${writing ? '✍️' : '⏳'} <b>${htmlEscape(writing ? 'Writing' : title)}</b> · ${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}`
+      + `${count ? ` · ${count} step${count === 1 ? '' : 's'}` : ''}`;
+    const body = previewText(text.length > DRAFT_MAX_TEXT ? `…${text.slice(-DRAFT_MAX_TEXT)}` : text).trim();
+    return [head, ...(mode.steps ? steps.slice(-mode.steps) : []), body ? `\n${htmlEscape(body)} ▍` : ''].filter(Boolean).join('\n');
+  };
+  const send = async () => {
+    timer = null;
+    if (stopped || failed) return;
+    lastAt = Date.now();
+    try {
+      await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML', can_stop: true }, { lowPriority: true });
+      updates++;
+    } catch (e) {
+      failed = true; // typing and reactions still show the task is alive
+      log(`draft: ${e.message}`);
+    }
+  };
+  const schedule = () => {
+    if (timer || stopped || failed) return;
+    timer = setTimeout(send, Math.max(0, DRAFT_MIN_GAP_MS - (Date.now() - lastAt)));
+  };
+  const keepalive = setInterval(schedule, DRAFT_KEEPALIVE_MS);
+  if (onStop) drafts.set(draftId, onStop);
+  send();
+  return {
+    // A stream-json event: text deltas grow the draft; tool calls add steps.
+    step(ev) {
+      if (!ev) return;
+      if (ev.type === 'stream_event' && ev.event) {
+        const e = ev.event;
+        // Each new text block is what Claude is saying now; earlier
+        // narration between tool calls is replaced.
+        if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'text') text = '';
+        if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') { text += e.delta.text || ''; streamed += (e.delta.text || '').length; schedule(); }
+        return;
+      }
+      if (ev.type !== 'assistant' || !ev.message || !Array.isArray(ev.message.content)) return;
+      let added = false;
+      for (const c of ev.message.content) {
+        if (!c || c.type !== 'tool_use') continue;
+        const line = toolLine(String(c.name || ''), c.input);
+        if (!line) continue;
+        if (count === 0 && workingReaction) tgReact(replyTo, workingReaction);
+        count++; added = true;
+        steps.push(line);
+        if (steps.length > 3) steps.shift();
+      }
+      if (added) schedule();
+    },
+    stop() {
+      stopped = true;
+      clearInterval(keepalive);
+      clearTimeout(timer);
+      drafts.delete(draftId);
+      log(`draft: ${updates} update(s), ${streamed} chars streamed, ${count} step(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s${failed ? ' (stopped after an error)' : ''}`);
+    },
+  };
+}
+
+// ⏹ Stop under a draft: Telegram sends stopped_message_generation.
+function draftStopped(update) {
+  if (!update || String(update.chat && update.chat.id) !== String(config.chat_id)) return;
+  const onStop = drafts.get(update.draft_id);
+  if (!onStop) return;
+  log(`draft ${update.draft_id}: Stop tapped`);
+  onStop();
 }
 
 // ---------- Incoming media ----------
@@ -1849,9 +1994,10 @@ async function handleMessage(item) {
   await rolloverIfNewDay();
   const stopTyping = startTyping();
   const fork = item.resumeFrom && !permissionMode ? item.resumeFrom : null;
-  const status = startStatus(msgId, permissionMode === 'plan'
+  const statusOpts = permissionMode === 'plan'
     ? { title: 'Planning (read-only)' }
-    : { title: fork ? 'Continuing an earlier conversation' : 'Working', workingReaction: '👨‍💻' });
+    : { title: fork ? 'Continuing an earlier conversation' : 'Working', workingReaction: '👨‍💻' };
+  const status = useDraft() ? startDraft(msgId, { ...statusOpts, onStop: () => stopActiveTask() }) : startStatus(msgId, statusOpts);
   try {
     if (fork) await runForkTask(rawText, msgId, Date.now(), fork, status);
     else await runTask(rawText, msgId, Date.now(), { permissionMode, status });
@@ -2949,7 +3095,7 @@ async function pollLoop() {
         offset: state.updateOffset,
         // Short polls while work runs, so a starting tg_ask takes over quickly.
         timeout: busy || bgTasks.size ? 10 : 50,
-        allowed_updates: ['message', 'callback_query'],
+        allowed_updates: ['message', 'callback_query', 'stopped_message_generation'],
       }, { httpTimeoutMs: 75 * 1000 });
     } catch (e) {
       // 409 Conflict = tg_ask just started polling; the loop pauses on its flag.
@@ -2961,7 +3107,8 @@ async function pollLoop() {
     for (const u of updates) {
       state.updateOffset = u.update_id + 1;
       saveState();
-      if (u.message) await dispatchMessage(u.message);
+      if (u.stopped_message_generation) draftStopped(u.stopped_message_generation);
+      else if (u.message) await dispatchMessage(u.message);
       else if (u.callback_query && !fromOwner(u.callback_query.from)) {
         tgApi('answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Only the bot owner can use these buttons.' }).catch(() => {});
         log(`ignored button tap from user ${u.callback_query.from && u.callback_query.from.id}`);
