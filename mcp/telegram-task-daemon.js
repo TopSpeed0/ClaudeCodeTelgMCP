@@ -2336,6 +2336,7 @@ let sentryChecking = false;
 function sentryState() {
   if (!state.sentry) state.sentry = { active: SENTRY.active !== false, known: {}, baselined: {}, muted: {}, health: {} };
   if (!state.sentry.ignored) state.sentry.ignored = {}; // source name (or '*' for all) → title patterns from Telegram
+  if (!state.sentry.sourcesOff) state.sentry.sourcesOff = {}; // source name → true when switched off on the /sentry card
   return state.sentry;
 }
 // Ignored alert types for a source: its ignore_titles in the config, plus
@@ -2380,6 +2381,7 @@ async function sentryCheck() {
   const firstLook = [];
   try {
     for (const source of SENTRY_SOURCES) {
+      if (s.sourcesOff[source.name]) continue;
       const health = s.health[source.name] = s.health[source.name] || { fails: 0 };
       let alerts;
       try {
@@ -2457,10 +2459,12 @@ function sentryView(note) {
   const s = sentryState();
   const lines = SENTRY_SOURCES.map((source) => {
     const h = s.health[source.name] || {};
-    if (h.error) return `⚠️ <b>${htmlEscape(source.name)}</b>: ${htmlEscape(shorten(h.error, 120))}`;
-    if (h.open == null) return `▫️ <b>${htmlEscape(source.name)}</b>: not checked yet`;
+    const name = `<b>${htmlEscape(source.name)}</b> <i>(MCP ${htmlEscape(source.server)})</i>`;
+    if (s.sourcesOff[source.name]) return `⚪ ${name}: off`;
+    if (h.error) return `⚠️ ${name}: ${htmlEscape(shorten(h.error, 120))}`;
+    if (h.open == null) return `🟢 ${name}: not checked yet`;
     const posted = Object.values(s.known).filter(e => e.source === source.name && e.msgId).length;
-    return `✅ <b>${htmlEscape(source.name)}</b>: ${h.open} open${posted ? `, ${posted} posted here` : ''}`;
+    return `🟢 ${name}: ${h.open} open${posted ? `, ${posted} posted here` : ''}`;
   });
   const muted = Object.values(s.muted).filter(until => until > Date.now()).length;
   const ignored = ignoreList().length + SENTRY_SOURCES.reduce((n, src) => n + (src.ignore_titles || []).length, 0);
@@ -2468,13 +2472,34 @@ function sentryView(note) {
   return {
     text: `🛰 <b>Sentry mode</b>: ${s.active ? '🟢 Active' : '⚪ Disabled'}${note ? ` · ${htmlEscape(note)}` : ''}\n`
       + `Every ${SENTRY_EVERY_MS / 60000} min, no Claude run · last check ${last}${muted ? ` · ${muted} muted` : ''}\n\n${lines.join('\n')}`
-      + `${ignored ? `\n\n🙈 ${ignored} ignored alert type${ignored === 1 ? '' : 's'} · <code>/sentry ignored</code>` : ''}`,
+      + `${ignored ? `\n\n🙈 ${ignored} ignored alert type${ignored === 1 ? '' : 's'} · <code>/sentry ignored</code>` : ''}`
+      + '\n<i>Tap a source to switch it on or off.</i>',
     reply_markup: { inline_keyboard: [[
       { text: s.active ? '🟢 Active' : 'Activate', callback_data: 'sn:on', style: s.active ? 'success' : undefined },
       { text: s.active ? 'Disable' : '⚪ Disabled', callback_data: 'sn:off', style: s.active ? undefined : 'danger' },
       { text: '🔄 Check now', callback_data: 'sn:now' },
-    ]] },
+    ], ...SENTRY_SOURCES.map((source, i) => [{
+      text: `${s.sourcesOff[source.name] ? '⚪' : '🟢'} ${source.name}`,
+      callback_data: `sn:src:${i}`,
+      style: s.sourcesOff[source.name] ? undefined : 'success',
+    }])] },
   };
+}
+
+// One source on or off (its button on the /sentry card). Back on, it starts
+// with a fresh count of what is open, like /sentry on.
+function sentryToggleSource(index) {
+  const source = SENTRY_SOURCES[Number(index)];
+  if (!source) return null;
+  const s = sentryState();
+  if (s.sourcesOff[source.name]) {
+    delete s.sourcesOff[source.name];
+    delete s.baselined[source.name];
+  } else {
+    s.sourcesOff[source.name] = true;
+  }
+  saveState();
+  return `${source.name} ${s.sourcesOff[source.name] ? 'off' : 'on'}`;
 }
 
 // /sentry on|off|now, or the same from its buttons. Turning it on again
@@ -2548,6 +2573,10 @@ function sentryButton(cq) {
     const note = sentrySet(action);
     answer(`Sentry ${note}`);
     redraw(note);
+  } else if (action === 'src') {
+    const note = sentryToggleSource(ref);
+    answer(note || 'Unknown source');
+    if (note) redraw(note);
   } else if (action === 'now') {
     answer('🔄 Checking…');
     sentryCheck().then(() => redraw('checked just now')).catch(e => log(`sentry: ${e.stack || e.message}`));
@@ -3029,8 +3058,9 @@ async function doctorReport() {
   const outbox = (state.outbox || []).length;
   add(outbox ? 'warn' : 'ok', 'Delivery', `queue ${state.queue.length} · side tasks ${bgTasks.size}${outbox ? ` · ${outbox} answer(s) waiting to be resent` : ' · nothing undelivered'}`);
   if (SENTRY_SOURCES.length) {
-    const failing = SENTRY_SOURCES.filter(src => ((sentryState().health[src.name] || {}).error)).map(src => src.name);
-    add(failing.length ? 'warn' : 'ok', 'Sentry', `${sentryActive() ? 'active' : 'disabled'} · ${SENTRY_SOURCES.length} source(s)${failing.length ? ` · not reading: ${failing.join(', ')}` : ''}`);
+    const on = SENTRY_SOURCES.filter(src => !sentryState().sourcesOff[src.name]);
+    const failing = on.filter(src => ((sentryState().health[src.name] || {}).error)).map(src => src.name);
+    add(failing.length ? 'warn' : 'ok', 'Sentry', `${sentryActive() ? 'active' : 'disabled'} · ${on.length} of ${SENTRY_SOURCES.length} source(s) on${failing.length ? ` · not reading: ${failing.join(', ')}` : ''}`);
   }
   const summaries = Object.keys(loadDailySummaries()).sort();
   add('ok', 'Archive', `${readDayTurns(state.day || localDayKey()).length} turns today · ${summaries.length} daily summaries${summaries.length ? ` (latest ${summaries[summaries.length - 1]})` : ''}`);
