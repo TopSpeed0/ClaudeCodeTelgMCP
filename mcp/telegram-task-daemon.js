@@ -2222,7 +2222,7 @@ async function runScheduled(job) {
 const SEARCH_SHOW = 8;
 const SEARCH_SUMMARY_HITS = 25;
 const SEARCH_SUMMARY_CHARS = 40000;
-let lastSearch = null; // { nonce, query, hits }: what 🧠 Summarize works on
+const SEARCH_KEEP = 20; // recent searches whose 🧠 Summarize button still works, kept in state across restarts
 
 function searchDate(hit) {
   const opts = { weekday: 'short', day: '2-digit', month: '2-digit', year: '2-digit' };
@@ -2243,31 +2243,51 @@ function searchView(query) {
     const reply = snippet(hit.assistant, terms) || htmlEscape(shorten(hit.assistant, 100));
     return `📅 <b>${searchDate(hit)}</b>${hit.source ? ` · ${htmlEscape(hit.source)}` : ''}\n👤 ${user}\n🤖 ${reply}`;
   });
-  lastSearch = { nonce: crypto.randomBytes(4).toString('hex'), query, hits };
+  const nonce = crypto.randomBytes(4).toString('hex');
+  state.searches = [...(state.searches || []), { nonce, query }].slice(-SEARCH_KEEP);
+  saveState();
   const more = hits.length > SEARCH_SHOW ? `Showing the newest ${SEARCH_SHOW}. Add words to narrow it, or ` : '';
   return {
     text: `🔎 <b>${hits.length} match${hits.length === 1 ? '' : 'es'}</b> for <i>${htmlEscape(query)}</i>, newest first\n\n${entries.join('\n\n')}\n\n`
       + `${more}${more ? 'tap' : 'Tap'} 🧠 Summarize for what was done${hits.length > SEARCH_SUMMARY_HITS ? ` (newest ${SEARCH_SUMMARY_HITS})` : ''}.`,
-    buttons: [[{ text: '🧠 Summarize', callback_data: `sr:sum:${lastSearch.nonce}`, style: 'primary' }]],
+    buttons: [[{ text: '🧠 Summarize', callback_data: `sr:sum:${nonce}`, style: 'primary' }]],
   };
 }
 
-// A tap on 🧠 Summarize. Only the latest search can be summarized. Returns
-// false when the button was not ours.
+// A tap on 🧠 Summarize: any of the last SEARCH_KEEP searches, also after a
+// restart (the search runs again). Returns false when the button was not ours.
 function searchButton(cq) {
   const [tag, , nonce] = String(cq.data || '').split(':');
   if (tag !== 'sr') return false;
   if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
-  const live = !!lastSearch && nonce === lastSearch.nonce;
-  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: live ? '🧠 Summarizing…' : '⌛ Out of date: search again.' }).catch(() => {});
+  const saved = (state.searches || []).find(s => s.nonce === nonce);
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: saved ? '🧠 Summarizing…' : '⌛ Too old: search again.' }).catch(() => {});
   tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
     .catch(e => log(`search button: ${e.message}`));
-  if (live) summarizeSearch(lastSearch, cq.message.message_id).catch(e => log(`search summary: ${e.stack || e.message}`));
+  if (saved) {
+    const { hits } = searchArchive(ARCHIVE_DIR, saved.query);
+    // Reactions go on the user's /search message, which the result replies to.
+    const askId = cq.message.reply_to_message ? cq.message.reply_to_message.message_id : null;
+    summarizeSearch({ query: saved.query, hits }, cq.message.message_id, askId).catch(e => log(`search summary: ${e.stack || e.message}`));
+  }
   return true;
 }
 
-async function summarizeSearch({ query, hits }, replyTo) {
+async function summarizeSearch({ query, hits }, replyTo, askId) {
+  const count = Math.min(hits.length, SEARCH_SUMMARY_HITS);
+  if (!count) { await sendChunked('🧠 Nothing in the archive matches this search any more.', { mode: 'plain', replyTo }); return; }
+  tgReact(askId, '🤔');
   const stopTyping = startTyping();
+  // A silent note that counts the seconds, removed when the answer is in.
+  const t0 = Date.now();
+  const noteText = () => `🧠 <b>Summarizing</b> ${count} match${count === 1 ? '' : 'es'} for <i>${htmlEscape(query)}</i>… ${Math.round((Date.now() - t0) / 1000)}s`;
+  const note = await tgApi('sendMessage', {
+    chat_id: config.chat_id, text: noteText(), parse_mode: 'HTML', disable_notification: true,
+    reply_parameters: { message_id: replyTo, allow_sending_without_reply: true },
+  }).catch(e => { log(`search note: ${e.message}`); return null; });
+  const ticker = note && setInterval(() => tgApi('editMessageText', { chat_id: config.chat_id, message_id: note.message_id, text: noteText(), parse_mode: 'HTML' }, { lowPriority: true })
+    .catch(e => log(`search note: ${e.message}`)), 10000);
+  let ok = false;
   try {
     // Oldest first; when over the size cap, the oldest go.
     const blocks = hits.slice(0, SEARCH_SUMMARY_HITS).reverse().map(hit => (hit.kind === 'summary'
@@ -2281,9 +2301,14 @@ async function summarizeSearch({ query, hits }, replyTo) {
     let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
     if (envelope) recordUsage(envelope, CLAUDE_RUNTIME.model, 'search');
     const text = code === 0 && envelope && typeof envelope.result === 'string' ? envelope.result.trim() : '';
-    await sendChunked(text ? `🧠 **What the archive says about** \`${query.replace(/`/g, "'")}\`\n\n${text}` : '🧠 Could not summarize the search; see the daemon log.', { mode: 'rich', replyTo });
+    ok = !!text;
+    const dt = Math.round((Date.now() - t0) / 1000);
+    await sendChunked(ok ? `🧠 **What the archive says about** \`${query.replace(/`/g, "'")}\` (${count} matches, ${dt}s)\n\n${text}` : '🧠 Could not summarize the search; see the daemon log.', { mode: 'rich', replyTo });
   } finally {
     stopTyping();
+    if (ticker) clearInterval(ticker);
+    if (note) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: note.message_id }).catch(() => {});
+    tgReact(askId, ok ? '🎉' : '💔');
   }
 }
 
@@ -2532,6 +2557,7 @@ process.on('exit', releaseLock);
 // (crash, Task Manager, a parent app taking it down) was unexpected.
 const RESTART_MARKER = path.join(WORKDIR, '.telegram-task-daemon.restart');
 const HEARTBEAT_MS = 60 * 1000;
+const DELIBERATE_RESTART = '🔁 Restarted by the launcher';
 const LAUNCH_MODES = { auto: 'Auto (scheduled task)', manual: 'Manual (shortcut)', foreground: 'Foreground (terminal)' };
 
 function heartbeat() { state.aliveAt = Date.now(); saveState(); }
@@ -2549,7 +2575,7 @@ function previousStop() {
   state.cleanStopAt = null;
   if (clean) return `✅ Clean stop ${tgTime(clean, 'r', 'earlier')}`;
   if (!alive) return '🆕 First start';
-  if (marker >= alive - HEARTBEAT_MS) return '🔁 Restarted by the launcher';
+  if (marker >= alive - HEARTBEAT_MS) return DELIBERATE_RESTART;
   const seen = tgTime(alive, 't', shortTime(alive));
   if (Date.now() - os.uptime() * 1000 > alive) return `💤 PC restarted (last seen ${seen})`;
   return `⚠️ Unexpected stop, last seen ${seen} (killed or crashed)`;
@@ -2654,9 +2680,13 @@ async function motdText(prevStop) {
 }
 
 // Silent: the daily logon start should not buzz the phone. "motd": false in
-// agent-runtime.json's telegram section turns the banner off.
+// agent-runtime.json's telegram section turns the banner off. A deliberate
+// restart (the launcher or a deploy left the restart marker) sends none: the
+// banner is for logon, a PC restart, a crash or a stop. A task the restart
+// cut off still gets its own "Interrupted" note.
 async function sendMotd(prevStop) {
   if (TELEGRAM_RUNTIME.motd === false) return;
+  if (prevStop === DELIBERATE_RESTART) { log('startup banner skipped: deliberate restart'); return; }
   try { await tgApi('sendMessage', { chat_id: config.chat_id, parse_mode: 'HTML', text: await motdText(prevStop), disable_notification: true }); }
   catch (e) { log(`motd: ${e.message}`); }
 }
