@@ -2151,7 +2151,7 @@ function previousStop() {
   if (clean) return `✅ Clean stop ${tgTime(clean, 'r', 'earlier')}`;
   if (!alive) return '🆕 First start';
   if (marker >= alive - HEARTBEAT_MS) return '🔁 Restarted by the launcher';
-  const seen = tgTime(alive, 't', new Date(alive).toLocaleTimeString('en-GB'));
+  const seen = tgTime(alive, 't', shortTime(alive));
   if (Date.now() - os.uptime() * 1000 > alive) return `💤 PC restarted (last seen ${seen})`;
   return `⚠️ Unexpected stop, last seen ${seen} (killed or crashed)`;
 }
@@ -2200,12 +2200,21 @@ function planUsage() {
   });
 }
 
+// Fallback text inside <tg-time>, shown by clients that do not localize it:
+// "15:38", or "Wed 04/11 11:00" with the day.
+function shortTime(ms, withDay = false) {
+  const d = new Date(ms);
+  const hm = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  return withDay ? `${d.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: '2-digit' })} ${hm}` : hm;
+}
+
 function limitText(label, window, format) {
   if (!window || window.utilization == null) return `${label} n/a`;
   const pct = Math.round(window.utilization);
   const dot = pct >= 80 ? '🔴' : pct >= 50 ? '🟡' : '🟢';
-  const resets = Date.parse(window.resets_at);
-  return `${label} ${dot} <b>${pct}%</b>${resets ? ` (resets ${tgTime(resets, format, new Date(resets).toLocaleString('en-GB'))})` : ''}`;
+  // The API reports resets a fraction before the minute (16:19:59.39); show 16:20.
+  const resets = Math.round(Date.parse(window.resets_at) / 60000) * 60000;
+  return `${label} ${dot} <b>${pct}%</b>${resets ? ` (resets ${tgTime(resets, format, shortTime(resets, format !== 't'))})` : ''}`;
 }
 
 async function motdText(prevStop) {
@@ -2225,7 +2234,7 @@ async function motdText(prevStop) {
   if (state.sessionId) {
     const ctx = sessionContextTokens(state.sessionId);
     session = `↩️ Resuming <code>${htmlEscape(state.sessionId.slice(0, 8))}</code>`
-      + (ctx != null ? ` · context <b>${k(ctx)}</b> / ${k(ROTATE_TOKENS)}` : '');
+      + (ctx != null ? ` · context <b>${k(ctx)}</b> (new conversation at ${k(ROTATE_TOKENS)})` : '');
   } else {
     session = `🆕 New session${sessionExpiredAtStart ? ' (the last one was idle over 2h)' : ''}`;
   }
@@ -2234,8 +2243,8 @@ async function motdText(prevStop) {
     ? `${limitText('5h', plan.five_hour, 't')} | ${limitText('Week', plan.seven_day, 'wt')}`
     : 'n/a (usage not reachable)';
   return `🟢 <b>Claude bridge online</b>\n\n`
-    + `Current Time: ${tgTime(now, 'wDT', new Date(now).toLocaleString('en-GB'))}\n`
-    + `Mode: <code>${htmlEscape(mode)}</code> | TimeStart: ${tgTime(started, 't', DAEMON_STARTED_AT.toLocaleTimeString('en-GB'))} | PC: <code>${htmlEscape(os.hostname())}</code>\n`
+    + `Current Time: ${tgTime(now, 'wDT', shortTime(now, true))}\n`
+    + `Mode: <code>${htmlEscape(mode)}</code> | TimeStart: ${tgTime(started, 't', shortTime(started))} | PC: <code>${htmlEscape(os.hostname())}</code>\n`
     + `ActiveUser: <code>${htmlEscape(user)}</code> | LastJobStatus: ${jobText}\n`
     + `Session: ${session}\n`
     + `Model: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code> | Queue: <code>${state.queue.length}</code>\n`
