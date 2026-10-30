@@ -2680,13 +2680,13 @@ async function motdText(prevStop) {
 }
 
 // Silent: the daily logon start should not buzz the phone. "motd": false in
-// agent-runtime.json's telegram section turns the banner off. A deliberate
-// restart (the launcher or a deploy left the restart marker) sends none: the
-// banner is for logon, a PC restart, a crash or a stop. A task the restart
-// cut off still gets its own "Interrupted" note.
+// agent-runtime.json's telegram section turns the banner off. A deploy
+// (restart marker, then a start through the scheduled task) sends none; the
+// shortcut, a terminal start, logon, a PC restart and a crash still do. A
+// task the restart cut off still gets its own "Interrupted" note.
 async function sendMotd(prevStop) {
   if (TELEGRAM_RUNTIME.motd === false) return;
-  if (prevStop === DELIBERATE_RESTART) { log('startup banner skipped: deliberate restart'); return; }
+  if (prevStop === DELIBERATE_RESTART && process.env.TG_DAEMON_LAUNCH === 'auto') { log('startup banner skipped: restart through the scheduled task'); return; }
   try { await tgApi('sendMessage', { chat_id: config.chat_id, parse_mode: 'HTML', text: await motdText(prevStop), disable_notification: true }); }
   catch (e) { log(`motd: ${e.message}`); }
 }
