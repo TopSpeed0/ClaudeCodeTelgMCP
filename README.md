@@ -55,9 +55,19 @@ claude
 
 > **Headless servers**: If the machine has no browser (e.g., the task daemon runs on a server), use the API key method.
 
+### Setup Wizard (Windows, recommended)
+
+Clone the repo and run the wizard. It checks Node.js and Claude Code, tests the connection to Telegram (and turns on `--use-system-ca` when a corporate TLS proxy is in the way), asks for your bot token, finds your chat ID when you send the bot a message, writes the gitignored config files, and offers autostart at sign-in, Start Menu / Desktop shortcuts and a first start with a "Setup done" message:
+
+```powershell
+git clone https://github.com/TopSpeed0/ClaudeCodeTelgMCP.git; cd ClaudeCodeTelgMCP; pwsh -File mcp/setup.ps1
+```
+
+Run it again any time to repair a setup: what exists is kept and only missing pieces are fixed (`-Reconfigure` asks for the bot again; `-Yes` accepts every default; `-NoAutostart`, `-NoShortcuts`, `-NoStart` skip those steps). Then send `/doctor` to the bot.
+
 ### One-Prompt Install
 
-Copy-paste this single block — it clones the repo, creates your config, and opens Claude Code:
+Manual alternative (and the macOS / Linux path). Copy-paste this single block — it clones the repo, creates your config, and opens Claude Code:
 
 **Windows (PowerShell):**
 ```powershell
@@ -177,7 +187,7 @@ When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-
 ## Requirements
 
 - [Claude Code CLI](https://claude.com/claude-code) installed and authenticated
-- Node.js 18+ (22+ if you need `--use-system-ca` for corporate TLS)
+- Node.js 22.15+ (the launcher starts the daemon with `--use-system-ca`)
 - PowerShell 7+ (for the launcher and shortcut scripts)
 - A Telegram bot token + your chat ID
 - Optional, for voice notes: Python 3.9+ with `faster-whisper`, ffmpeg, and a one-time Whisper model download (500 MB – 1.6 GB); see [Voice Notes](#optional-voice-notes)
