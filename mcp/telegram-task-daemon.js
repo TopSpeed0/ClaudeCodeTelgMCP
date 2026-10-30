@@ -799,7 +799,9 @@ async function compactConversation() {
     chat_id: config.chat_id, parse_mode: 'HTML', disable_notification: true,
     text: `🗜 <b>Compacting</b> this conversation${before != null ? ` (${k(before)} tokens)` : ''}… usually under a minute.`,
   }).catch((e) => { log(`compact note: ${e.message}`); return null; });
+  const stopTyping = startTyping();
   const finish = async (text) => {
+    stopTyping();
     if (!note || !note.message_id) return text;
     try { await tgApi('editMessageText', { chat_id: config.chat_id, message_id: note.message_id, parse_mode: 'HTML', text }); return null; }
     catch (e) { log(`compact note: ${e.message}`); return text; }
@@ -808,10 +810,15 @@ async function compactConversation() {
   closeWarm('/compact');
   if (w && w.proc.exitCode == null) await Promise.race([new Promise(r => w.proc.once('exit', r)), new Promise(r => setTimeout(r, 6000))]);
   let handle = null;
-  const { code, out } = await claudeRaw('/compact', ['--resume', sessionId], {
-    nativeMcp: false, onSpawn: (h) => { handle = h; activeTask = h; }, // /stop can cancel it
-  });
-  if (activeTask === handle) activeTask = null;
+  let code, out;
+  try {
+    ({ code, out } = await claudeRaw('/compact', ['--resume', sessionId], {
+      nativeMcp: false, onSpawn: (h) => { handle = h; activeTask = h; }, // /stop can cancel it
+    }));
+  } finally {
+    stopTyping();
+    if (activeTask === handle) activeTask = null;
+  }
   let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
   if (code !== 0 || !envelope || envelope.is_error || envelope.local_command !== 'compact') {
     log(`compact failed (exit=${code}): ${String(out).slice(0, 300)}`);
@@ -821,7 +828,8 @@ async function compactConversation() {
   saveState();
   const after = sessionContextTokens(sessionId);
   log(`compacted session ${sessionId}: ${before} -> ${after} tokens`);
-  return finish(`🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.`);
+  return finish(`🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.\n`
+    + `Session: ${sessionLine()}`);
 }
 
 function maybeRotate({ notify = true } = {}) {
@@ -1623,7 +1631,7 @@ async function telegramCommand(rawText) {
         if (!state.sessionId) return 'Already fresh: the next message starts a new conversation.';
         const ctx = sessionContextTokens(state.sessionId);
         startFreshConversation('/refresh');
-        return `♻️ <b>Refreshed</b>${ctx != null ? ` (the conversation was ${Math.round(ctx / 1000)}k tokens)` : ''}. Your next message starts a fresh conversation; the last ${RECENT_TURNS} turns and a summary of earlier ones carry over.`;
+        return `♻️ <b>Refreshed</b>${ctx != null ? ` (the conversation was ${Math.round(ctx / 1000)}k tokens)` : ''}. Your next message starts a fresh conversation; the last ${RECENT_TURNS} turns and a summary of earlier ones carry over.\nSession: ${sessionLine()}`;
       },
       clear: () => {
         closeWarm('/new');
@@ -2273,6 +2281,15 @@ function limitText(label, window, format) {
   return `${label} ${dot} <b>${pct}%</b>${resets ? ` (resets ${tgTime(resets, format, shortTime(resets, format !== 't'))})` : ''}`;
 }
 
+// Which conversation the next message lands in, and how full it is.
+function sessionLine(expired = false) {
+  if (!state.sessionId) return `🆕 New session${expired ? ' (the last one was idle over 2h)' : ''}`;
+  const k = (n) => `${Math.round(n / 1000)}k`;
+  const ctx = sessionContextTokens(state.sessionId);
+  return `↩️ Resuming <code>${htmlEscape(state.sessionId.slice(0, 8))}</code>`
+    + (ctx != null ? ` · context <b>${k(ctx)}</b> (new conversation at ${k(ROTATE_TOKENS)})` : '');
+}
+
 async function motdText(prevStop) {
   const now = Date.now();
   const started = DAEMON_STARTED_AT.getTime();
@@ -2285,15 +2302,6 @@ async function motdText(prevStop) {
   const launch = process.env.TG_DAEMON_LAUNCH;
   const mode = LAUNCH_MODES[launch] || launch || (process.stdout.isTTY ? LAUNCH_MODES.foreground : 'Background');
   const user = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${os.userInfo().username}` : os.userInfo().username;
-  const k = (n) => `${Math.round(n / 1000)}k`;
-  let session;
-  if (state.sessionId) {
-    const ctx = sessionContextTokens(state.sessionId);
-    session = `↩️ Resuming <code>${htmlEscape(state.sessionId.slice(0, 8))}</code>`
-      + (ctx != null ? ` · context <b>${k(ctx)}</b> (new conversation at ${k(ROTATE_TOKENS)})` : '');
-  } else {
-    session = `🆕 New session${sessionExpiredAtStart ? ' (the last one was idle over 2h)' : ''}`;
-  }
   const plan = await planUsage();
   const limits = plan
     ? `${limitText('5h', plan.five_hour, 't')} | ${limitText('Week', plan.seven_day, 'wt')}`
@@ -2302,7 +2310,7 @@ async function motdText(prevStop) {
     + `Current Time: ${tgTime(now, 'wDT', shortTime(now, true))}\n`
     + `Mode: <code>${htmlEscape(mode)}</code> | TimeStart: ${tgTime(started, 't', shortTime(started))} | PC: <code>${htmlEscape(os.hostname())}</code>\n`
     + `ActiveUser: <code>${htmlEscape(user)}</code> | LastJobStatus: ${jobText}\n`
-    + `Session: ${session}\n`
+    + `Session: ${sessionLine(sessionExpiredAtStart)}\n`
     + `Model: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code> | Queue: <code>${state.queue.length}</code>\n`
     + `Limits: ${limits}\n`
     + `PrevStop: ${prevStop}`;
