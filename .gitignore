@@ -11,9 +11,8 @@ CLAUDE.local.md
 .claude/settings.local.json
 agent-runtime.json
 
-# Local docs, not published yet
-FEATURES-MANIFEST.md
-IDEAS-ROADMAP.md
+# Local docs (feature map, roadmap), not published
+docs/local/
 
 # Runtime state files
 .telegram-state.json
