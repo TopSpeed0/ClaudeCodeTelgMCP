@@ -74,4 +74,15 @@ function diffAlerts(known, sourceName, alerts) {
 // What a mute applies to: the same alert on the same object, whatever its id.
 const muteKey = (sourceName, alert) => `${sourceName}|${alert.title}|${alert.object}`.toLowerCase();
 
-module.exports = { pick, fill, alertTime, readAlerts, diffAlerts, muteKey };
+// Ignored alert types: a title matches a pattern when it contains it (any
+// case), or, for "/regex/", when the regex matches. A bad regex matches nothing.
+function titleIgnored(title, patterns) {
+  const t = String(title || '');
+  return (patterns || []).some((p) => {
+    const re = /^\/(.+)\/([a-z]*)$/.exec(String(p));
+    if (!re) return String(p).trim() !== '' && t.toLowerCase().includes(String(p).trim().toLowerCase());
+    try { return new RegExp(re[1], re[2].includes('i') ? re[2] : `${re[2]}i`).test(t); } catch (_) { return false; }
+  });
+}
+
+module.exports = { pick, fill, alertTime, readAlerts, diffAlerts, muteKey, titleIgnored };

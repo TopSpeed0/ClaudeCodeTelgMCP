@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { pick, fill, alertTime, readAlerts, diffAlerts, muteKey } = require('../mcp/sentry-alerts');
+const { pick, fill, alertTime, readAlerts, diffAlerts, muteKey, titleIgnored } = require('../mcp/sentry-alerts');
 
 const MONITOR = {
   name: 'Monitor', server: 'monitoring', tool: 'active_alerts', list: 'result',
@@ -50,6 +50,15 @@ test('tells new alerts from cleared ones, per source', () => {
   const { added, cleared } = diffAlerts(known, 'Monitor', readAlerts(MONITOR, DATA));
   assert.deepEqual(added.map(a => a.key), ['Monitor#2']);
   assert.deepEqual(cleared.map(c => c.key), ['Monitor#9']);
+});
+
+test('ignores alert types by text or /regex/, any case', () => {
+  const title = 'Virtual machine disk I/O write latency is high';
+  assert.equal(titleIgnored(title, ['disk i/o write LATENCY']), true);
+  assert.equal(titleIgnored(title, ['/write latency is (high|critical)/']), true);
+  assert.equal(titleIgnored(title, ['read latency', '  ']), false);
+  assert.equal(titleIgnored(title, ['/[bad/']), false, 'a broken regex matches nothing');
+  assert.equal(titleIgnored(title, undefined), false);
 });
 
 test('a mute covers the same alert on the same object, whatever the id', () => {

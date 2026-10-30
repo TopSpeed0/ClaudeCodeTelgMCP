@@ -25,7 +25,7 @@ const {
 const { resolveQueueModel } = require('./queue-model');
 const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-schedule');
 const { snippet, searchArchive } = require('./archive-search');
-const { fill, pick, readAlerts, diffAlerts, muteKey } = require('./sentry-alerts');
+const { fill, pick, readAlerts, diffAlerts, muteKey, titleIgnored } = require('./sentry-alerts');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
@@ -1642,7 +1642,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — read-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating read-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
@@ -2019,12 +2019,11 @@ async function drainQueue() {
 // the archive context but never touch the pinned session or the queue.
 const MAX_BG_TASKS = 2;
 
-// intro replaces the /bg preamble and permissionMode: 'plan' makes the run
-// read-only (🔎 Investigate under a sentry alert uses both).
-function startBgTask(argument, msgId, { intro, permissionMode } = {}) {
+// intro replaces the /bg preamble (🔎 Investigate under a sentry alert).
+function startBgTask(argument, msgId, { intro } = {}) {
   if (!argument) return 'Usage: <code>/bg &lt;task&gt;</code>: runs in its own session, in parallel with the main chat.';
   if (bgTasks.size >= MAX_BG_TASKS) return `⚡ ${MAX_BG_TASKS} side tasks are already running. Wait for one, or <code>/stop bg</code>.`;
-  const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now(), intro, permissionMode };
+  const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now(), intro };
   bgTasks.set(msgId, entry);
   markRunning(msgId, { kind: 'bg', text: argument });
   runBgTask(entry, msgId)
@@ -2043,7 +2042,7 @@ async function runBgTask(entry, msgId) {
     const intro = entry.intro || '[Side task from Telegram (/bg): it runs in its own session, in parallel with the main conversation.]';
     const task = `${intro}\n\n${entry.text}`;
     const { ok, text: result, code, actualId } = await runClaude(task, {
-      contextPrefix, isolated: true, replyTo: msgId, source: 'bg', permissionMode: entry.permissionMode,
+      contextPrefix, isolated: true, replyTo: msgId, source: 'bg',
       onEvent: (ev) => status.step(ev),
       onSpawn: (handle) => { entry.handle = handle; if (entry.stopped) stopHandle(handle, '/stop bg'); },
     });
@@ -2073,17 +2072,19 @@ async function runBgTask(entry, msgId) {
 
 // ---------- Scheduled checks (/remind, /every) ----------
 // Jobs live in state.schedules, so they survive restarts; one that came due
-// while the bot was down runs once when it is back. Each run is an isolated,
-// read-only (plan mode) session, since nobody is at the phone to approve a
-// change. One run at a time; a run with nothing to report can stay silent.
+// while the bot was down runs once when it is back. Each run is an isolated
+// session told to look and change nothing. Not plan mode: that blocks every
+// MCP tool, so the check could not reach the systems it checks; the approval
+// gate still holds anything risky for the user's ✅. One run at a time; a run
+// with nothing to report can stay silent.
 const SCHEDULE_TICK_MS = 30 * 1000;
 const SCHEDULE_MAX_FAILS = 3; // a repeating job pauses after this many failures in a row
 const SCHEDULE_QUIET = /^\s*\[quiet\]\s*\.?\s*$/i;
 let scheduleRun = null; // the run in flight: { handle, stopped, text, startedAt, jobId }
 
 const scheduleNote = (job) => `[Scheduled check from Telegram (${job.rule ? `/every, ${describeRule(job.rule)}` : '/remind, once'}). `
-  + 'It runs unattended in read-only mode: you cannot change anything, and tg_send is unavailable. '
-  + 'Do the check and give the result as your final message; the daemon relays it. '
+  + 'It runs unattended: look only and change nothing (anything risky would wait for the user\'s approval). '
+  + 'Do the check and give the result as your final message, not through tg_send; the daemon relays it. '
   + 'If the request asks to hear only about problems or only when something happened, and there is nothing to report, reply with exactly [quiet] and nothing else.]\n\n';
 
 function schedules() { return (state.schedules = state.schedules || []); }
@@ -2100,7 +2101,7 @@ function listJobs() {
   const jobs = schedules().slice().sort((a, b) => a.nextAt - b.nextAt);
   if (!jobs.length) return 'No scheduled checks.\n<code>/remind 45m check if the vMotion finished</code>\n<code>/every weekdays 07:30 check SnapMirror lag, tell me only if bad</code>';
   return `<b>⏰ Scheduled checks (${jobs.length})</b>\n\n${jobs.map(jobLine).join('\n\n')}\n\n`
-    + 'Read-only runs. <code>/remind pause|resume|cancel &lt;id&gt;</code>';
+    + 'Look-only runs; anything risky waits for your OK. <code>/remind pause|resume|cancel &lt;id&gt;</code>';
 }
 
 // /remind and /every: add a job, or list / pause / resume / cancel one.
@@ -2137,7 +2138,7 @@ function scheduleCommand(kind, argument, msgId) {
   log(`schedule: added ${job.id} (${job.rule ? describeRule(job.rule) : 'once'}) next=${new Date(job.nextAt).toISOString()}`);
   return `${job.rule ? '🔁' : '⏰'} <b>Scheduled</b> <code>${job.id}</code>: ${job.rule ? htmlEscape(describeRule(job.rule)) : 'once'}, `
     + `${job.rule ? 'first run' : 'runs'} ${tgTime(job.nextAt, 'wDT', shortTime(job.nextAt, true))}.\n`
-    + `Read-only run in its own session; the result comes here. <code>/remind cancel ${job.id}</code>`;
+    + `Runs in its own session, told to look only; anything risky waits for your OK. The result comes here. <code>/remind cancel ${job.id}</code>`;
 }
 
 // ⏸ Pause / 🗑 Delete under a repeating job's result. Returns false when the
@@ -2173,7 +2174,7 @@ async function runScheduled(job) {
   try {
     const contextPrefix = await buildRestoreContext();
     ({ ok, text: result, code, actualId } = await runClaude(scheduleNote(job) + job.text, {
-      contextPrefix, isolated: true, permissionMode: 'plan', replyTo: job.msgId, source: 'schedule',
+      contextPrefix, isolated: true, replyTo: job.msgId, source: 'schedule',
       onSpawn: (handle) => { entry.handle = handle; if (entry.stopped) stopHandle(handle, '/stop bg'); },
     }));
   } finally {
@@ -2322,7 +2323,7 @@ async function summarizeSearch({ query, hits }, replyTo, askId) {
 // Claude session uses, with no Claude run: every few minutes each source in
 // agent-runtime.json (telegram.sentry.sources, see sentry-alerts.js) is
 // asked for its alerts, and what is new is posted with 🔎 Investigate (a
-// read-only side task) and 🔕 Mute 24h. A reported alert that goes away gets
+// look-only side task; risky steps still need the user's ✅) and 🔕 Mute 24h. A reported alert that goes away gets
 // a silent ✅ Cleared reply. The alerts already open when watching starts
 // (first run, or /sentry on) are only counted, not posted.
 const SENTRY = TELEGRAM_RUNTIME.sentry || {};
@@ -2334,8 +2335,18 @@ let sentryChecking = false;
 
 function sentryState() {
   if (!state.sentry) state.sentry = { active: SENTRY.active !== false, known: {}, baselined: {}, muted: {}, health: {} };
+  if (!state.sentry.ignored) state.sentry.ignored = {}; // source name (or '*' for all) → title patterns from Telegram
   return state.sentry;
 }
+// Ignored alert types for a source: its ignore_titles in the config, plus
+// the ones added from Telegram (🙈 Ignore type, /sentry ignore).
+const ignoredPatterns = (sourceName) => {
+  const ignored = sentryState().ignored;
+  const source = SENTRY_SOURCES.find(src => src.name === sourceName) || {};
+  return [...(source.ignore_titles || []), ...(ignored[sourceName] || []), ...(ignored['*'] || [])];
+};
+// Telegram-added patterns, numbered for /sentry ignored and /sentry unignore <n>.
+const ignoreList = () => Object.entries(sentryState().ignored).flatMap(([scope, patterns]) => patterns.map(pattern => ({ scope, pattern })));
 const sentryActive = () => SENTRY_SOURCES.length > 0 && sentryState().active;
 const alertRef = (key) => crypto.createHash('sha1').update(key).digest('hex').slice(0, 10);
 const findAlert = (ref) => Object.entries(sentryState().known).find(([key]) => alertRef(key) === ref) || [];
@@ -2393,6 +2404,7 @@ async function sentryCheck() {
         if (baseline) continue;
         const muteUntil = s.muted[muteKey(source.name, alert)];
         if (muteUntil && muteUntil > Date.now()) { entry.muted = true; continue; }
+        if (titleIgnored(alert.title, ignoredPatterns(source.name))) { entry.ignored = true; continue; }
         entry.muteKey = muteKey(source.name, alert);
         entry.object = await lookupObject(source, alert);
         entry.server = source.server;
@@ -2403,6 +2415,7 @@ async function sentryCheck() {
           reply_markup: { inline_keyboard: [[
             { text: '🔎 Investigate', callback_data: `sn:inv:${ref}`, style: 'primary' },
             { text: '🔕 Mute 24h', callback_data: `sn:mute:${ref}` },
+            { text: '🙈 Ignore type', callback_data: `sn:ign:${ref}` },
           ]] },
         }).catch(e => { log(`sentry: post: ${e.message}`); return null; });
         if (sent) entry.msgId = sent.message_id;
@@ -2410,7 +2423,7 @@ async function sentryCheck() {
       }
       for (const { key, entry } of cleared) {
         delete s.known[key];
-        if (!entry.msgId || SENTRY.cleared === false) continue;
+        if (!entry.msgId || SENTRY.cleared === false || titleIgnored(entry.title, ignoredPatterns(source.name))) continue;
         await tgApi('sendMessage', {
           chat_id: config.chat_id, parse_mode: 'HTML', disable_notification: true,
           text: `✅ <b>Cleared</b>: ${htmlEscape(entry.title)}${entry.object ? ` · ${htmlEscape(entry.object)}` : ''}`,
@@ -2450,10 +2463,12 @@ function sentryView(note) {
     return `✅ <b>${htmlEscape(source.name)}</b>: ${h.open} open${posted ? `, ${posted} posted here` : ''}`;
   });
   const muted = Object.values(s.muted).filter(until => until > Date.now()).length;
+  const ignored = ignoreList().length + SENTRY_SOURCES.reduce((n, src) => n + (src.ignore_titles || []).length, 0);
   const last = s.lastCheck ? tgTime(s.lastCheck, 'r', shortTime(s.lastCheck)) : 'not yet';
   return {
     text: `🛰 <b>Sentry mode</b>: ${s.active ? '🟢 Active' : '⚪ Disabled'}${note ? ` · ${htmlEscape(note)}` : ''}\n`
-      + `Every ${SENTRY_EVERY_MS / 60000} min, no Claude run · last check ${last}${muted ? ` · ${muted} muted` : ''}\n\n${lines.join('\n')}`,
+      + `Every ${SENTRY_EVERY_MS / 60000} min, no Claude run · last check ${last}${muted ? ` · ${muted} muted` : ''}\n\n${lines.join('\n')}`
+      + `${ignored ? `\n\n🙈 ${ignored} ignored alert type${ignored === 1 ? '' : 's'} · <code>/sentry ignored</code>` : ''}`,
     reply_markup: { inline_keyboard: [[
       { text: s.active ? '🟢 Active' : 'Activate', callback_data: 'sn:on', style: s.active ? 'success' : undefined },
       { text: s.active ? 'Disable' : '⚪ Disabled', callback_data: 'sn:off', style: s.active ? undefined : 'danger' },
@@ -2472,8 +2487,41 @@ function sentrySet(action) {
   return action === 'on' ? 'already active' : action === 'off' ? 'already disabled' : null;
 }
 
+// /sentry ignore <text> (all sources) · /sentry ignored · /sentry unignore <n>
+function sentryIgnoreCommand(sub, rest) {
+  const s = sentryState();
+  if (sub === 'ignore') {
+    if (!rest) return 'Usage: <code>/sentry ignore disk I/O write latency</code>: alerts whose title contains the text (any case) are not posted, from any source. <code>/regex/</code> works too.';
+    const all = s.ignored['*'] = s.ignored['*'] || [];
+    if (!all.some(p => p.toLowerCase() === rest.toLowerCase())) all.push(rest);
+    saveState();
+    return `🙈 Ignoring alerts whose title matches <i>${htmlEscape(rest)}</i>, from every source. <code>/sentry ignored</code> to see or undo.`;
+  }
+  if (sub === 'unignore') {
+    const n = Number(rest);
+    const item = ignoreList()[n - 1];
+    if (!item) return 'Usage: <code>/sentry unignore &lt;n&gt;</code>, with the number from <code>/sentry ignored</code>.';
+    s.ignored[item.scope] = s.ignored[item.scope].filter(p => p !== item.pattern);
+    if (!s.ignored[item.scope].length) delete s.ignored[item.scope];
+    saveState();
+    return `👀 Watching <i>${htmlEscape(item.pattern)}</i> again.`;
+  }
+  const items = ignoreList();
+  const fromConfig = SENTRY_SOURCES.flatMap(src => (src.ignore_titles || []).map(p => `• ${htmlEscape(src.name)}: <i>${htmlEscape(p)}</i>`));
+  if (!items.length && !fromConfig.length) return '🙈 No ignored alert types. Tap 🙈 Ignore type under an alert, or send <code>/sentry ignore &lt;text&gt;</code>.';
+  return `🙈 <b>Ignored alert types</b>\n${items.map((item, i) => `${i + 1}. ${item.scope === '*' ? 'all sources' : htmlEscape(item.scope)}: <i>${htmlEscape(item.pattern)}</i>`).join('\n')}`
+    + `${items.length ? '\n<code>/sentry unignore &lt;n&gt;</code> to watch one again.' : ''}`
+    + `${fromConfig.length ? `\n\nFrom agent-runtime.json (edit it there):\n${fromConfig.join('\n')}` : ''}`;
+}
+
 async function sentryCommand(argument, replyTo) {
-  const action = String(argument || '').trim().toLowerCase();
+  const raw = String(argument || '').trim();
+  const sub = raw.split(/\s+/)[0].toLowerCase();
+  if (SENTRY_SOURCES.length && ['ignore', 'ignored', 'unignore'].includes(sub)) {
+    await sendChunked(sentryIgnoreCommand(sub, raw.slice(sub.length).trim()), { mode: 'html', replyTo });
+    return;
+  }
+  const action = raw.toLowerCase();
   let note = '';
   if (SENTRY_SOURCES.length && ['on', 'off', 'active', 'disable', 'disabled'].includes(action)) note = sentrySet(action.startsWith('on') || action === 'active' ? 'on' : 'off');
   if (SENTRY_SOURCES.length && action === 'now') { await sentryCheck(); note = 'checked just now'; }
@@ -2510,20 +2558,28 @@ function sentryButton(cq) {
       sentryState().muted[entry.muteKey || muteKey(entry.source, entry)] = Date.now() + SENTRY_MUTE_MS;
       saveState();
       answer('🔕 Muted for 24 h: this alert on this object.');
+    } else if (action === 'ign') {
+      const ignored = sentryState().ignored;
+      const list = ignored[entry.source] = ignored[entry.source] || [];
+      if (!list.some(p => p.toLowerCase() === entry.title.toLowerCase())) list.push(entry.title);
+      saveState();
+      answer(`🙈 Ignoring "${shorten(entry.title, 80)}" from ${entry.source}. /sentry ignored to undo.`);
     } else if (action === 'inv') {
-      const intro = '[Sentry alert triage from Telegram. This run is read-only: you cannot change anything, and tg_send is unavailable; '
-        + 'your final message is relayed. Find out what is wrong, how serious it is, the likely cause and what to do next, using the matching skills and '
+      // Not plan mode: it blocks every MCP tool. Look-only by instruction; the
+      // approval gate still holds anything risky for the user's ✅.
+      const intro = '[Sentry alert triage from Telegram, in its own session. Look only and change nothing: this is a diagnosis '
+        + '(anything risky would wait for the user\'s approval anyway). Find out what is wrong, how serious it is, the likely cause and what to do next, using the matching skills and '
         + `MCP tools (the "${entry.server}" server first). Verdict first, then the evidence, then a short recommendation.]`;
       const facts = `Source: ${entry.source}\nAlert: ${entry.title}\nObject: ${entry.object || '(none)'}\nSeverity: ${entry.severity || '(none)'}\n`
         + `Since: ${entry.time ? new Date(entry.time).toISOString() : '(unknown)'}\nAlert key: ${key}\nRaw alert: ${entry.raw || '(not kept)'}`;
-      const reply = startBgTask(facts, cq.message.message_id, { intro, permissionMode: 'plan' });
-      answer(/already running/.test(reply) ? 'Two side tasks are already running; try again soon.' : '🔎 Investigating (read-only)…');
+      const reply = startBgTask(facts, cq.message.message_id, { intro });
+      answer(/already running/.test(reply) ? 'Two side tasks are already running; try again soon.' : '🔎 Investigating…');
       if (/already running/.test(reply)) sendChunked(reply, { mode: 'html', replyTo: cq.message.message_id }).catch(() => {});
     }
   }
-  if (action === 'inv' || action === 'mute') {
-    // Keep 🔎 Investigate after a mute; drop both after Investigate.
-    const keep = action === 'mute' ? [[{ text: '🔎 Investigate', callback_data: `sn:inv:${ref}`, style: 'primary' }]] : [];
+  if (action === 'inv' || action === 'mute' || action === 'ign') {
+    // Keep 🔎 Investigate after a mute or ignore; drop the buttons after Investigate.
+    const keep = action !== 'inv' ? [[{ text: '🔎 Investigate', callback_data: `sn:inv:${ref}`, style: 'primary' }]] : [];
     tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: keep } }, { lowPriority: true })
       .catch(e => log(`sentry buttons: ${e.message}`));
   }
