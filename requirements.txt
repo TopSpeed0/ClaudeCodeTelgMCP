@@ -7,6 +7,6 @@
 # min_version = optional (leave empty to skip version check)
 # check_command = command to verify installation
 
-node::22.15.0:node --version
+node:Node.js:22.15.0:node --version
 npm-global:@anthropic-ai/claude-code:0.2.0:claude --version
 binary:git::git --version

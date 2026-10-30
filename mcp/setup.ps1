@@ -15,7 +15,8 @@ param(
   [switch]$NoAutostart,   # skip the Windows scheduled task
   [switch]$NoShortcuts,   # skip the Start Menu / Desktop shortcuts
   [switch]$NoStart,       # do not start the bridge at the end
-  [string]$TaskName = 'Claude Telegram Task Bridge'
+  [string]$TaskName = 'Claude Telegram Task Bridge',
+  [string]$BotToken       # skip the token question (unattended setup); still checked with Telegram
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,9 +53,12 @@ function Tg($token, $method, $body = @{}) {
   Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/$method" -Method Post `
     -Body (ConvertTo-Json -InputObject $body -Depth 5) -ContentType 'application/json' -TimeoutSec 70
 }
+# The bridge started from this folder (matched by the full script path), not
+# one running from another checkout.
 function Daemons() {
+  $daemon = Join-Path $PSScriptRoot 'telegram-task-daemon.js'
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+    Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($daemon, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
 }
 $placeholder = '^\s*$|^YOUR_|^123456789'
 
@@ -99,11 +103,15 @@ $configPath = Join-Path $repo '.telegram-config'
 $saved = Read-JsonFile $configPath
 $token = if ($saved -and -not $Reconfigure) { [string]$saved.bot_token } else { '' }
 $chatId = if ($saved -and -not $Reconfigure) { [string]$saved.chat_id } else { '' }
+if ($BotToken) {
+  if ($BotToken.Trim() -ne $token) { $chatId = '' } # another bot: find the chat again
+  $token = $BotToken.Trim()
+}
 if ($token -match $placeholder) { $token = '' }
 if ($chatId -match $placeholder) { $chatId = '' }
 $bot = $null
 if ($token) {
-  try { $bot = (Tg $token 'getMe').result; Ok "Bot @$($bot.username), from the saved .telegram-config" }
+  try { $bot = (Tg $token 'getMe').result; Ok "Bot @$($bot.username), from $(if ($BotToken) { '-BotToken' } else { 'the saved .telegram-config' })" }
   catch { Note "The saved bot token was rejected ($($_.Exception.Message)); asking for a new one."; $token = ''; $chatId = '' }
 }
 if (-not $token) {

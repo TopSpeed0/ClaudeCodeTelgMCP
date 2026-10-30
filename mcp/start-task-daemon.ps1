@@ -12,6 +12,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+$daemon = Join-Path $PSScriptRoot 'telegram-task-daemon.js'
+
+# The daemons started from THIS folder (matched by the full script path), so a
+# second checkout on the same PC, such as a test clone, never stops this one.
+function Get-OwnDaemon {
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($daemon, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+}
 
 # The Start Menu / Desktop shortcuts run this with -WindowStyle Hidden, so an
 # unhandled error would disappear with the window and look like "nothing happened".
@@ -27,8 +35,7 @@ trap {
 # turns that into a no-op while a daemon is alive, instead of a kill-and-restart
 # cycle that would drop whatever task the bot is in the middle of.
 if ($IfNotRunning) {
-  $live = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+  $live = Get-OwnDaemon
   if ($live) {
     Write-Host "Daemon already running (PID=$($live.ProcessId)); nothing to do."
     exit 0
@@ -78,13 +85,11 @@ if (Test-Path $reqFile) {
   }
   Write-Host "[requirements] All OK`n" -ForegroundColor Green
 }
-$daemon = Join-Path $PSScriptRoot 'telegram-task-daemon.js'
 $logFile = Join-Path $PSScriptRoot 'task-daemon.log'
 
-# Kill any existing daemon so the shortcut acts as a clean restart.
+# Kill this folder's existing daemon so the shortcut acts as a clean restart.
 # Match by command line so we only touch *our* node process, not unrelated Node apps.
-$existing = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+$existing = Get-OwnDaemon
 if ($existing) {
   # A killed daemon looks the same as a crashed one; this marker lets the new
   # daemon's startup banner report the stop as a deliberate restart.
@@ -109,8 +114,7 @@ if (Test-Path $lockFile) {
   $lockPid = (Get-Content $lockFile -Raw).Trim()
   $holder = $null
   if ($lockPid -match '^\d+$') {
-    $holder = Get-CimInstance Win32_Process -Filter "ProcessId=$lockPid" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -and $_.CommandLine -match 'telegram-task-daemon\.js' }
+    $holder = Get-OwnDaemon | Where-Object { "$($_.ProcessId)" -eq $lockPid }
   }
   if (-not $holder) {
     Write-Host "Clearing stale lock (PID=$lockPid is not a running daemon)" -ForegroundColor Yellow
