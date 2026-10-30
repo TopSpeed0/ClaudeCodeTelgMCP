@@ -1359,6 +1359,66 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
   };
 }
 
+// While a voice note is downloaded and transcribed (a model load, then CPU
+// time close to the note's length), a draft bubble shows the stage, the time,
+// how far into the audio it is and the words heard so far; the reaction turns
+// ✍ while it writes. Without drafts, a typing action is kept alive instead.
+function startVoiceProgress(replyTo) {
+  const draftId = crypto.randomInt(1, 2 ** 31 - 1);
+  const t0 = Date.now();
+  const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  let stage = '🎧 Getting your voice note', heard = '', at = 0, duration = 0;
+  let stopped = false, failed = !useDraft(), timer = null, lastAt = 0, updates = 0;
+  const render = () => {
+    const secs = Math.floor((Date.now() - t0) / 1000);
+    const head = `${stage} · ${secs}s${duration ? ` · 🎙 ${clock(at)} / ${clock(duration)}` : ''}`;
+    const text = heard.length > DRAFT_MAX_TEXT ? `…${heard.slice(-DRAFT_MAX_TEXT)}` : heard;
+    return `<b>${htmlEscape(head)}</b>${text ? `\n\n<i>${htmlEscape(text)}</i> ▍` : ''}`;
+  };
+  const send = async () => {
+    timer = null;
+    if (stopped || failed) return;
+    lastAt = Date.now();
+    try {
+      await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML' }, { lowPriority: true });
+      updates++;
+    } catch (e) {
+      failed = true;
+      log(`voice draft: ${e.message}`);
+    }
+  };
+  const schedule = () => {
+    if (timer || stopped || failed) return;
+    timer = setTimeout(send, Math.max(0, DRAFT_MIN_GAP_MS - (Date.now() - lastAt)));
+  };
+  // The clock ticks every few seconds, so a long model load still looks alive.
+  const tick = setInterval(() => {
+    if (failed) tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }, { lowPriority: true }).catch(() => {});
+    else schedule();
+  }, 4000);
+  send();
+  return {
+    update(kind, arg = '') {
+      if (stopped) return;
+      if (kind === 'model') stage = '🧠 Loading the speech model';
+      else if (kind === 'audio') { stage = '✍️ Transcribing'; duration = Number(arg) || 0; tgReact(replyTo, '✍'); }
+      else if (kind === 'seg') {
+        const [, end, words] = /^(\S+)\s?(.*)$/.exec(arg) || [];
+        at = Number(end) || at;
+        if (words) heard = heard ? `${heard} ${words}` : words;
+      } else if (kind === 'mixed') stage = '🌐 Re-checking mixed languages';
+      else return;
+      schedule();
+    },
+    stop() {
+      stopped = true;
+      clearInterval(tick);
+      clearTimeout(timer);
+      log(`voice draft: ${updates} update(s), ${heard.length} chars heard in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    },
+  };
+}
+
 // ⏹ Stop under a draft: Telegram sends stopped_message_generation.
 function draftStopped(update) {
   if (!update || String(update.chat && update.chat.id) !== String(config.chat_id)) return;
@@ -1431,19 +1491,31 @@ function sttAvailable() {
   return sttReady;
 }
 
-function transcribe(file) {
+// onProgress(stage, arg) gets the transcriber's "@stt" stderr lines: model,
+// audio <seconds>, seg "<end> <text>", mixed. Other stderr is kept for errors.
+function transcribe(file, onProgress) {
   return new Promise((resolve, reject) => {
     const script = path.join(__dirname, 'stt-faster-whisper.py');
     const proc = spawn(PYTHON, [script, file, String(VOICE.model || 'small'), String(VOICE.language || '')], {
       stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, STT_HOTWORDS: sttHints() },
     });
-    let out = '', err = '';
+    let out = '', err = '', partial = '';
     proc.stdout.on('data', d => out += d.toString());
-    proc.stderr.on('data', d => err += d.toString());
+    proc.stderr.setEncoding('utf8');
+    proc.stderr.on('data', (d) => {
+      const lines = (partial + d).split('\n');
+      partial = lines.pop();
+      for (const line of lines) {
+        const m = /^@stt (\w+) ?(.*)$/.exec(line.trim());
+        if (!m) err += `${line}\n`;
+        else if (onProgress) try { onProgress(m[1], m[2]); } catch (e) { log(`stt progress: ${e.message}`); }
+      }
+    });
     const timer = setTimeout(() => killTree(proc), 5 * 60 * 1000);
     proc.on('error', (e) => { clearTimeout(timer); reject(e); });
     proc.on('close', (code) => {
       clearTimeout(timer);
+      err += partial;
       if (code === 0 && out.trim()) resolve(out.trim());
       else reject(new Error(err.trim().split('\n').slice(-2).join(' ') || `transcriber exit ${code}`));
     });
@@ -1495,7 +1567,9 @@ async function proposeVoicePlan(msgId, transcript, correction) {
     + 'PLAN:\n1. <short step>\n2. <short step>\n(1 to 5 steps)]\n\n'
     + `Transcript: "${transcript}"`
     + (correction ? `\n\nThe user corrected your previous reading: "${correction}". Use that.` : '');
-  const status = startStatus(msgId, { title: 'Understanding your voice note (read-only)' });
+  tgReact(msgId, '🤔');
+  const statusOpts = { title: 'Understanding your voice note (read-only)' };
+  const status = useDraft() ? startDraft(msgId, { ...statusOpts, onStop: () => stopActiveTask() }) : startStatus(msgId, statusOpts);
   let outcome;
   try {
     outcome = await runClaude(prompt, { permissionMode: 'plan', replyTo: msgId, source: 'voice', onEvent: (ev) => status.step(ev) });
@@ -1606,9 +1680,15 @@ async function buildMediaTask(item) {
     return { error: '🎙 Voice notes need a speech-to-text engine (faster-whisper), which is not installed yet. Type the message instead, or ask me to install voice support.' };
   }
   if (isSpeech) {
-    const file = await downloadMedia(media, item.msgId);
-    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }, { lowPriority: true }).catch(() => {});
-    const transcript = await transcribe(file);
+    const progress = startVoiceProgress(item.msgId);
+    let transcript;
+    try {
+      const file = await downloadMedia(media, item.msgId);
+      progress.update('model');
+      transcript = await transcribe(file, progress.update);
+    } finally {
+      progress.stop();
+    }
     if (!VOICE_CONFIRM) await sendChunked(`🎙 <i>${htmlEscape(transcript)}</i>`, { mode: 'html', replyTo: item.msgId });
     return { transcript, confirm: VOICE_CONFIRM, taskText: `${caption ? `${caption}\n\n` : ''}[Voice message from the user, transcribed locally]: ${transcript}` };
   }
