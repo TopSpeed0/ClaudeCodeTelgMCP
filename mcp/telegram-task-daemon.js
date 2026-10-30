@@ -23,6 +23,7 @@ const {
   telegramCommandName, mcpCommandNames, skillCommandNames, skillMenuDescription, buildCommandMenu,
 } = require('./telegram-command-router');
 const { resolveQueueModel } = require('./queue-model');
+const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-schedule');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
@@ -239,6 +240,7 @@ function htmlEscape(s) {
 //
 // Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists.
 // Out of scope: tables, links, images, Markdown blockquotes.
+const TELEGRAM_TAG = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|tg-spoiler|blockquote)>|<blockquote expandable>|<a href="[^"<>]*">|<\/a>|<tg-time\b[^<>]*>|<\/tg-time>/gi;
 function markdownToTelegramHTML(text) {
   // Stash fenced code blocks first so their contents are immune to subsequent
   // bold/italic/header rewrites. We replace them back at the very end.
@@ -255,8 +257,18 @@ function markdownToTelegramHTML(text) {
     return `\u0000IC${inlineCodes.length - 1}\u0000`;
   });
 
-  // Escape HTML entities in the remaining (non-code) text.
-  html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Telegram's own HTML tags (an agent writing HTML to stdout, as CLAUDE.md
+  // teaches for tg_send) pass through; unbalanced ones make Telegram reject
+  // the chunk, and sendChunked then resends it as plain text.
+  const tags = [];
+  html = html.replace(TELEGRAM_TAG, (tag) => {
+    tags.push(tag);
+    return `\u0000TG${tags.length - 1}\u0000`;
+  });
+
+  // Escape HTML entities in the remaining (non-code) text; existing entities stay.
+  html = html.replace(/&(?!(?:amp|lt|gt|quot|#\d+);)/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  html = html.replace(/\u0000TG(\d+)\u0000/g, (_m, i) => tags[Number(i)]);
 
   // Bold: **x** or __x__
   html = html.replace(/\*\*([^\n*]+?)\*\*/g, '<b>$1</b>');
@@ -1628,7 +1640,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — read-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating read-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
@@ -1638,9 +1650,11 @@ async function telegramCommand(rawText) {
       progress: (argument) => progressCommand(argument).text,
       usage: () => formatUsage(),
       doctor: () => doctorReport(),
+      remind: (argument) => scheduleCommand('remind', argument),
+      every: (argument) => scheduleCommand('every', argument),
       status: () => {
         const readiness = mcp();
-        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -2050,6 +2064,155 @@ async function runBgTask(entry, msgId) {
   }
 }
 
+// ---------- Scheduled checks (/remind, /every) ----------
+// Jobs live in state.schedules, so they survive restarts; one that came due
+// while the bot was down runs once when it is back. Each run is an isolated,
+// read-only (plan mode) session, since nobody is at the phone to approve a
+// change. One run at a time; a run with nothing to report can stay silent.
+const SCHEDULE_TICK_MS = 30 * 1000;
+const SCHEDULE_MAX_FAILS = 3; // a repeating job pauses after this many failures in a row
+const SCHEDULE_QUIET = /^\s*\[quiet\]\s*\.?\s*$/i;
+let scheduleRun = null; // the run in flight: { handle, stopped, text, startedAt, jobId }
+
+const scheduleNote = (job) => `[Scheduled check from Telegram (${job.rule ? `/every, ${describeRule(job.rule)}` : '/remind, once'}). `
+  + 'It runs unattended in read-only mode: you cannot change anything, and tg_send is unavailable. '
+  + 'Do the check and give the result as your final message; the daemon relays it. '
+  + 'If the request asks to hear only about problems or only when something happened, and there is nothing to report, reply with exactly [quiet] and nothing else.]\n\n';
+
+function schedules() { return (state.schedules = state.schedules || []); }
+const findJob = (id) => schedules().find(job => job.id === String(id || '').toLowerCase().replace(/^#/, ''));
+const jobKind = (job) => (job.rule ? `🔁 ${describeRule(job.rule)}` : '⏰ once');
+
+function jobLine(job) {
+  const when = job.paused ? '⏸ paused' : `next ${tgTime(job.nextAt, 'wDT', shortTime(job.nextAt, true))}`;
+  const last = job.lastResult ? ` · last: ${job.lastResult}` : '';
+  return `<code>${job.id}</code> ${htmlEscape(jobKind(job))} · ${when}${last}\n<i>${htmlEscape(shorten(job.text, 90))}</i>`;
+}
+
+function listJobs() {
+  const jobs = schedules().slice().sort((a, b) => a.nextAt - b.nextAt);
+  if (!jobs.length) return 'No scheduled checks.\n<code>/remind 45m check if the vMotion finished</code>\n<code>/every weekdays 07:30 check SnapMirror lag, tell me only if bad</code>';
+  return `<b>⏰ Scheduled checks (${jobs.length})</b>\n\n${jobs.map(jobLine).join('\n\n')}\n\n`
+    + 'Read-only runs. <code>/remind pause|resume|cancel &lt;id&gt;</code>';
+}
+
+// /remind and /every: add a job, or list / pause / resume / cancel one.
+function scheduleCommand(kind, argument, msgId) {
+  const [sub, id] = String(argument || '').trim().split(/\s+/);
+  const action = (sub || 'list').toLowerCase();
+  if (action === 'list') return listJobs();
+  if (['pause', 'resume', 'cancel', 'delete'].includes(action)) {
+    const job = findJob(id);
+    if (!job) return `No scheduled check <code>${htmlEscape(id || '?')}</code>. /remind list shows them.`;
+    if (action === 'pause') job.paused = true;
+    if (action === 'resume') {
+      job.paused = false;
+      job.fails = 0;
+      if (job.rule && job.nextAt <= Date.now()) job.nextAt = nextRun(job.rule, Date.now());
+    }
+    if (action === 'cancel' || action === 'delete') state.schedules = schedules().filter(j => j !== job);
+    saveState();
+    return action === 'pause' ? `⏸ Paused <code>${job.id}</code>.`
+      : action === 'resume' ? `▶️ Resumed <code>${job.id}</code>: next ${tgTime(job.nextAt, 'wDT', shortTime(job.nextAt, true))}.`
+      : `🗑 Cancelled <code>${job.id}</code>.`;
+  }
+  const parsed = kind === 'every' ? parseEvery(argument) : parseRemind(argument);
+  if (parsed.error) return parsed.error;
+  let jobId;
+  do jobId = crypto.randomBytes(2).toString('hex'); while (findJob(jobId));
+  const job = {
+    id: jobId, text: parsed.text, rule: parsed.rule || null,
+    nextAt: parsed.rule ? nextRun(parsed.rule, Date.now()) : parsed.at,
+    paused: false, fails: 0, msgId, createdAt: Date.now(),
+  };
+  schedules().push(job);
+  saveState();
+  log(`schedule: added ${job.id} (${job.rule ? describeRule(job.rule) : 'once'}) next=${new Date(job.nextAt).toISOString()}`);
+  return `${job.rule ? '🔁' : '⏰'} <b>Scheduled</b> <code>${job.id}</code>: ${job.rule ? htmlEscape(describeRule(job.rule)) : 'once'}, `
+    + `${job.rule ? 'first run' : 'runs'} ${tgTime(job.nextAt, 'wDT', shortTime(job.nextAt, true))}.\n`
+    + `Read-only run in its own session; the result comes here. <code>/remind cancel ${job.id}</code>`;
+}
+
+// ⏸ Pause / 🗑 Delete under a repeating job's result. Returns false when the
+// button was not ours.
+function scheduleButton(cq) {
+  const [tag, action, id] = String(cq.data || '').split(':');
+  if (tag !== 'sj') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const job = findJob(id);
+  let answer = 'This scheduled check no longer exists.';
+  if (job && action === 'pause') { job.paused = true; answer = `⏸ Paused. /remind resume ${job.id} to restart it.`; }
+  if (job && action === 'del') { state.schedules = schedules().filter(j => j !== job); answer = `🗑 Deleted ${job.id}.`; }
+  saveState();
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: answer }).catch(() => {});
+  tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+    .catch(e => log(`schedule button: ${e.message}`));
+  return true;
+}
+
+async function scheduleTick() {
+  if (scheduleRun) return;
+  const now = Date.now();
+  const job = schedules().filter(j => !j.paused && j.nextAt <= now).sort((a, b) => a.nextAt - b.nextAt)[0];
+  if (job) await runScheduled(job);
+}
+
+async function runScheduled(job) {
+  const entry = { handle: null, stopped: false, text: job.text, startedAt: Date.now(), jobId: job.id };
+  scheduleRun = entry;
+  const lateBy = Date.now() - job.nextAt;
+  log(`schedule: running ${job.id} (${job.rule ? describeRule(job.rule) : 'once'})`);
+  let ok, result, code, actualId;
+  try {
+    const contextPrefix = await buildRestoreContext();
+    ({ ok, text: result, code, actualId } = await runClaude(scheduleNote(job) + job.text, {
+      contextPrefix, isolated: true, permissionMode: 'plan', replyTo: job.msgId, source: 'schedule',
+      onSpawn: (handle) => { entry.handle = handle; if (entry.stopped) stopHandle(handle, '/stop bg'); },
+    }));
+  } finally {
+    scheduleRun = null;
+  }
+  const dt = ((Date.now() - entry.startedAt) / 1000).toFixed(1);
+  const trimmed = stripAnsi(result || '').trim();
+  const outcome = !ok ? (result === '__STOPPED__' ? 'stopped' : 'failed') : SCHEDULE_QUIET.test(trimmed) ? 'quiet' : 'reported';
+  log(`schedule: ${job.id} ${outcome} (${dt}s)`);
+
+  // Move the job on. It may have been cancelled while it ran.
+  const current = findJob(job.id);
+  if (current) {
+    current.lastRunAt = Date.now();
+    current.lastResult = outcome;
+    current.fails = outcome === 'failed' ? (current.fails || 0) + 1 : 0;
+    if (!current.rule) state.schedules = schedules().filter(j => j !== current);
+    else {
+      current.nextAt = nextRun(current.rule, Date.now());
+      if (current.fails >= SCHEDULE_MAX_FAILS) current.paused = true;
+    }
+    saveState();
+  }
+
+  const label = `${job.rule ? '🔁' : '⏰'} **${job.rule ? 'Scheduled check' : 'Reminder'}** \`${job.id}\``;
+  if (outcome === 'stopped') {
+    await sendChunked(`${label} stopped after ${dt}s.${job.rule ? '' : ' It will not run again.'}`, { mode: 'rich', replyTo: job.msgId });
+    return;
+  }
+  if (outcome === 'failed') {
+    const paused = current && current.paused ? `\nPaused after ${SCHEDULE_MAX_FAILS} failures in a row: \`/remind resume ${job.id}\` to restart it.` : '';
+    await sendChunked(`${label} **failed** (exit=${code}, ${dt}s):${paused}\n${trimmed || '(no output)'}`, { mode: 'rich', replyTo: job.msgId });
+    return;
+  }
+  let replyForArchive = trimmed;
+  if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
+  appendArchive({ day: state.day || localDayKey(), ts: new Date().toISOString(), source: 'schedule', user: `/${job.rule ? 'every' : 'remind'} ${job.text}`, assistant: replyForArchive, sessionId: actualId });
+  if (outcome === 'quiet' || !trimmed || TG_SENT_SENTINEL.test(trimmed)) return;
+  const late = lateBy > 5 * 60 * 1000 ? ` (due ${shortTime(job.nextAt, true)}; the bot was offline)` : '';
+  const buttons = current && current.rule ? [[
+    { text: '⏸ Pause', callback_data: `sj:pause:${job.id}` },
+    { text: '🗑 Delete', callback_data: `sj:del:${job.id}`, style: 'danger' },
+  ]] : undefined;
+  await sendChunked(`${label} · ${job.rule ? describeRule(job.rule) : 'once'}${late}\n\n${trimmed}`, { mode: 'rich', replyTo: job.msgId, buttons });
+}
+
 function formatQueue() {
   const lines = ['<b>📋 Queue</b>', ''];
   if (currentItem) {
@@ -2062,6 +2225,7 @@ function formatQueue() {
   for (const entry of bgTasks.values()) {
     lines.push(`⚡ <b>Side task</b> (${formatUptime((Date.now() - entry.startedAt) / 1000)}): <i>${htmlEscape(shorten(entry.text))}</i>`);
   }
+  if (scheduleRun) lines.push(`⏰ <b>Scheduled check</b> <code>${scheduleRun.jobId}</code> (${formatUptime((Date.now() - scheduleRun.startedAt) / 1000)}): <i>${htmlEscape(shorten(scheduleRun.text))}</i>`);
   state.queue.forEach((item, i) => lines.push(`${i + 1}. <i>${htmlEscape(shorten(itemLabel(item)))}</i>`));
   if (!state.queue.length) lines.push('', 'Nothing waiting.');
   return lines.join('\n');
@@ -2076,6 +2240,10 @@ function stopCommand(argument) {
       if (entry.stopped) continue;
       entry.stopped = true; n++;
       if (entry.handle) stopHandle(entry.handle, '/stop bg');
+    }
+    if (scheduleRun && !scheduleRun.stopped) {
+      scheduleRun.stopped = true; n++;
+      if (scheduleRun.handle) stopHandle(scheduleRun.handle, '/stop bg');
     }
     parts.push(n ? `⏹ Stopping ${n} side task(s)…` : 'No side task is running.');
     if (scope === 'bg') return parts.join('\n');
@@ -2184,6 +2352,11 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
       return;
     }
+    if (parsed && (parsed.command === 'remind' || parsed.command === 'every')) {
+      tgReact(m.message_id, '🫡');
+      await sendChunked(scheduleCommand(parsed.command, parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`schedule reply: ${e.message}`));
+      return;
+    }
     if (parsed && parsed.command === 'progress') {
       const view = progressCommand(parsed.argument);
       await tgApi('sendMessage', {
@@ -2237,7 +2410,7 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
-      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }
@@ -2546,6 +2719,7 @@ sendMotd(prevStop)
   .then(() => recoverInterrupted())
   .catch(e => log(`recovery: ${e.message}`))
   .then(() => prewarm())
-  .then(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)));
+  .then(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)))
+  .then(() => setInterval(() => scheduleTick().catch(e => log(`schedule: ${e.stack || e.message}`)), SCHEDULE_TICK_MS));
 pollLoop().catch(async (e) => { log(`fatal: ${e.stack || e.message}`); await setPresence(false); releaseLock(); process.exit(1); });
 hermesQueuePoll();
