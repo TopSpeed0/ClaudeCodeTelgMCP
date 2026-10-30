@@ -1,12 +1,12 @@
 'use strict';
 
-const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'search', 'sentry', 'progress']);
+const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'refresh', 'compact', 'stop', 'retry', 'usage', 'doctor', 'queue', 'plan', 'bg', 'remind', 'every', 'search', 'sentry', 'approvals', 'progress']);
 // Answered the moment they arrive, even while a task runs. /bg starts its own
 // isolated session at once; /remind and /every only store a job;
 // /search reads the archive; /sentry toggles the alert watch. Everything else (tasks and state-changing commands
 // such as /clear, /refresh, /compact, /model, /retry, /plan) waits its turn in the queue, so it
 // never races the running task.
-const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'search', 'sentry', 'progress']);
+const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'doctor', 'queue', 'bg', 'remind', 'every', 'search', 'sentry', 'approvals', 'progress']);
 const COMMAND_ALIASES = { new: 'clear' };
 const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Daemon status and runtime' },
@@ -20,6 +20,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'search', description: 'Find past conversations in the archive' },
   { command: 'sentry', description: 'Alert watch: status, on, off, check now' },
   { command: 'usage', description: 'Cost, turns and time: last task and today' },
+  { command: 'approvals', description: 'Latest approval decisions and Always rules' },
   { command: 'doctor', description: 'Health check: Telegram, Claude CLI, MCP, limits, autostart, disk' },
   { command: 'progress', description: 'How much live progress you see: off, quiet, normal, full' },
   { command: 'compact', description: "Shrink this conversation with Claude's own summary" },

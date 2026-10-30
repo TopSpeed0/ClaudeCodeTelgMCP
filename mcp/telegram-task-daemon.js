@@ -26,6 +26,7 @@ const { resolveQueueModel } = require('./queue-model');
 const { parseRemind, parseEvery, nextRun, describeRule } = require('./telegram-schedule');
 const { snippet, searchArchive } = require('./archive-search');
 const { fill, pick, readAlerts, diffAlerts, muteKey, titleIgnored } = require('./sentry-alerts');
+const { maskSecrets } = require('./secret-mask');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
 const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
@@ -96,6 +97,9 @@ function loadConfig() {
 }
 
 const config = loadConfig();
+// Only the owner's messages and button taps count. In a private chat the chat
+// id is the owner's user id; in a group chat (negative id) any member can.
+const fromOwner = (user) => Number(config.chat_id) < 0 || String(user && user.id) === String(config.chat_id);
 
 let state = { updateOffset: 0, sessionId: null, day: null, summary: '', lastActivity: null, queue: [], lastTask: null, usage: null };
 let sessionExpiredAtStart = false; // for the startup banner
@@ -1109,14 +1113,14 @@ function toolLine(name, input) {
     case 'Bash': case 'PowerShell': {
       if (i.description) return `💻 ${htmlEscape(shorten(i.description, 70))}`;
       const command = String(i.command || '').replace(/^\s*(?:cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*)+/i, '');
-      return `💻 ${one(command)}`;
+      return `💻 ${one(maskSecrets(command))}`;
     }
     case 'Read': return `📖 Read ${file(i.file_path)}`;
     case 'Write': return `📝 Write ${file(i.file_path)}`;
     case 'Edit': case 'MultiEdit': case 'NotebookEdit': return `✏️ Edit ${file(i.file_path || i.notebook_path)}`;
     case 'Grep': return `🔎 Search ${one(i.pattern, 50)}`;
     case 'Glob': return `🔎 Find ${one(i.pattern, 50)}`;
-    case 'WebFetch': return `🌐 Fetch ${one(i.url, 60)}`;
+    case 'WebFetch': return `🌐 Fetch ${one(maskSecrets(i.url), 60)}`;
     case 'WebSearch': return `🌐 Search ${one(i.query, 60)}`;
     case 'Agent': case 'Task': return `🤖 Agent: ${htmlEscape(shorten(i.description || '', 60))}`;
     case 'Skill': return `🧩 Skill ${one(i.skill, 40)}`;
@@ -1642,7 +1646,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/approvals — latest approval decisions and your Always rules · <code>/approvals revoke &lt;n&gt;</code>\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n/remind &lt;when&gt; &lt;task&gt; — a look-only check later, once (<code>45m</code>, <code>14:30</code>, <code>tomorrow 07:30</code>)\n/every &lt;when&gt; &lt;task&gt; — repeating look-only check (<code>2h</code>, <code>weekdays 07:30</code>, <code>sun-thu 07:30</code>); say "only if bad" to hear only about problems · <code>/remind list</code>\n/sentry — watch monitoring alerts (on · off · now); new ones come with 🔎 Investigate · <code>/sentry ignore &lt;text&gt;</code> · <code>/sentry ignored</code>\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/search &lt;words&gt; — find past conversations in the archive; 🧠 Summarize for what was done\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
@@ -1656,6 +1660,7 @@ async function telegramCommand(rawText) {
       every: (argument) => scheduleCommand('every', argument),
       search: (argument) => searchView(argument).text,
       sentry: () => sentryView().text,
+      approvals: (argument) => approvalsCommand(argument),
       status: () => {
         const readiness = mcp();
         return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code> · Scheduled: <code>${schedules().length}</code>\nSentry: <code>${SENTRY_SOURCES.length ? (sentryActive() ? `active, ${SENTRY_SOURCES.length} source(s)` : 'disabled') : 'not set up'}</code> (/sentry)\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
@@ -2221,6 +2226,54 @@ async function runScheduled(job) {
   await sendChunked(`${label} · ${job.rule ? describeRule(job.rule) : 'once'}${late}\n\n${trimmed}`, { mode: 'rich', replyTo: job.msgId, buttons });
 }
 
+// ---------- Approvals (/approvals) ----------
+// The approval hook logs every decision to archive/approvals.jsonl (commands
+// already masked) and keeps "🔁 Always" rules in .telegram-approvals.json.
+// /approvals shows the latest decisions and the Always rules;
+// /approvals revoke <n> removes a rule, so that action asks again.
+const APPROVALS_LOG = path.join(ARCHIVE_DIR, 'approvals.jsonl');
+const APPROVALS_RULES = path.join(WORKDIR, '.telegram-approvals.json');
+const APPROVALS_SHOW = 10;
+
+function approvalRules() {
+  try { return { sessions: {}, always: [], ...JSON.parse(fs.readFileSync(APPROVALS_RULES, 'utf8')) }; }
+  catch (_) { return { sessions: {}, always: [] }; }
+}
+
+function approvalsCommand(argument) {
+  const [sub, n] = String(argument || '').trim().split(/\s+/);
+  const rules = approvalRules();
+  if (/^(revoke|forget|remove)$/i.test(sub || '')) {
+    const rule = rules.always[Number(n) - 1];
+    if (!rule) return 'Usage: <code>/approvals revoke &lt;n&gt;</code>, with the number of an Always rule from <code>/approvals</code>.';
+    rules.always.splice(Number(n) - 1, 1);
+    fs.writeFileSync(`${APPROVALS_RULES}.tmp`, JSON.stringify(rules, null, 2));
+    fs.renameSync(`${APPROVALS_RULES}.tmp`, APPROVALS_RULES);
+    return `🗑 Removed the Always rule for <code>${htmlEscape(shorten(maskSecrets(rule.key), 120))}</code>. It will ask again.`;
+  }
+  let entries = [];
+  try {
+    entries = fs.readFileSync(APPROVALS_LOG, 'utf8').trim().split('\n').slice(-500)
+      .map((line) => { try { return JSON.parse(line); } catch (_) { return null; } }).filter(Boolean);
+  } catch (_) {}
+  const outcome = (e) => (e.decision === 'denied'
+    ? { timeout: '⌛ no answer, denied', error: `⚠️ denied (${e.how || 'error'})` }[e.scope] || '❌ denied'
+    : { session: '✅ allowed for the session', always: '🔁 allowed always', remembered: '♻️ allowed without asking' }[e.scope] || '✅ allowed once');
+  const recent = entries.slice(-APPROVALS_SHOW).reverse().map((e) => {
+    const at = Date.parse(e.ts);
+    return `${outcome(e)} · ${tgTime(at, 'wDT', shortTime(at, true))} · ${htmlEscape(e.label || '')}\n<code>${htmlEscape(shorten(e.command || e.tool || '', 100))}</code>`;
+  });
+  const today = entries.filter(e => localDayKey(new Date(e.ts)) === localDayKey());
+  const always = rules.always.map((r, i) => `${i + 1}. <code>${htmlEscape(shorten(maskSecrets(r.key), 90))}</code> · ${htmlEscape(r.label || '')}, since ${htmlEscape(String(r.added || '').slice(0, 10))}`);
+  const sessions = Object.keys(rules.sessions || {}).length;
+  return '<b>🛡 Approvals</b>'
+    + `\nToday: ${today.filter(e => e.decision === 'allowed').length} allowed · ${today.filter(e => e.decision === 'denied').length} denied`
+    + `\n\n<b>Latest</b>\n${recent.join('\n') || 'None logged yet.'}`
+    + `\n\n<b>🔁 Always rules</b> (allowed without asking)\n${always.join('\n') || 'None.'}`
+    + `${always.length ? '\n<code>/approvals revoke &lt;n&gt;</code> makes one ask again.' : ''}`
+    + `${sessions ? `\n\n${sessions} conversation(s) with "This session" approvals (they expire after 24 h).` : ''}`;
+}
+
 // ---------- Archive search (/search) ----------
 // Full-text search over every archived turn and daily summary, answered at
 // once without a Claude run. 🧠 Summarize under the result asks Claude, in a
@@ -2735,6 +2788,7 @@ async function handleStaleButton(cq) {
 async function dispatchMessage(m, { fromAsker = false } = {}) {
   if (!m || !m.chat) return;
   if (String(m.chat.id) !== String(config.chat_id)) { log(`ignored msg from chat ${m.chat.id}`); return; }
+  if (!fromOwner(m.from)) { log(`ignored msg from user ${m.from && m.from.id} in the owner's chat`); return; }
   const ownMedia = mediaOf(m);
   const text = ownMedia ? (m.caption || '') : (m.text || '');
   if (!ownMedia && !text) return; // stickers, polls, service messages
@@ -2821,7 +2875,10 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
-      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      else if (u.callback_query && !fromOwner(u.callback_query.from)) {
+        tgApi('answerCallbackQuery', { callback_query_id: u.callback_query.id, text: 'Only the bot owner can use these buttons.' }).catch(() => {});
+        log(`ignored button tap from user ${u.callback_query.from && u.callback_query.from.id}`);
+      } else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query) && !scheduleButton(u.callback_query) && !searchButton(u.callback_query) && !sentryButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }

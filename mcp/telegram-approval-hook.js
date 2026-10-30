@@ -8,6 +8,10 @@
 // The daemon wires it in through `--settings` (see writeDaemonSettings in
 // telegram-task-daemon.js). Interactive Claude sessions never load it.
 // Fail closed: no answer, or Telegram unreachable, means deny.
+// The command shown on Telegram has its secrets masked (secret-mask.js), only
+// the owner's tap or reply counts, an unanswered question is re-pinged 3 min
+// before it expires, and every decision goes to archive/approvals.jsonl
+// (/approvals in the bot).
 //
 // Rules: DEFAULT_RULES below, plus `approval.extra_patterns` (regex strings)
 // in agent-runtime.json; `approval.enabled: false` turns the gate off and
@@ -19,8 +23,20 @@ const path = require('path');
 const { createTelegramClient } = require('./telegram-client');
 const crypto = require('crypto');
 const handshake = require('./telegram-handshake');
+const { maskSecrets } = require('./secret-mask');
 
 const ROOT = path.resolve(__dirname, '..');
+
+// Every decision, asked or remembered, one JSON line each, for change control
+// and /approvals. archive/ is gitignored; commands are logged with secrets masked.
+const AUDIT_FILE = path.join(ROOT, 'archive', 'approvals.jsonl');
+function audit(entry) {
+  try {
+    fs.mkdirSync(path.dirname(AUDIT_FILE), { recursive: true });
+    fs.appendFileSync(AUDIT_FILE, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+  } catch (_) { /* the decision itself must not fail on logging */ }
+}
+const REMIND_BEFORE_MS = 3 * 60 * 1000; // an unanswered question is re-pinged this long before it is denied
 
 // [label, regex tested against the command text (shell tools) or tool name + input (MCP tools)]
 const DEFAULT_RULES = [
@@ -167,12 +183,24 @@ async function main() {
   if (settings.enabled === false) return process.exit(0);
   const match = classify(String(event.tool_name || ''), event.tool_input, Array.isArray(settings.extra_patterns) ? settings.extra_patterns : []);
   if (!match) return process.exit(0);
+  const shownFull = maskSecrets(match.text);
+  const record = (decision, scope, how) => audit({
+    decision, scope, how, label: match.label, tool: String(event.tool_name || ''),
+    command: shownFull.length > 500 ? `${shownFull.slice(0, 500)}…` : shownFull,
+    session: event.session_id || null, task: Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || handshake.currentTaskReplyTo() || null,
+  });
   const remembered = rememberedAllow(event, match);
-  if (remembered) return decide('allow', `Allowed without asking: ${remembered}.`);
+  if (remembered) { record('allowed', 'remembered', remembered); return decide('allow', `Allowed without asking: ${remembered}.`); }
 
   const timeoutMs = Math.max(30, Math.min(3600, Number(settings.timeout_seconds) || 600)) * 1000;
   let config;
-  try { config = loadConfig(); } catch (e) { return decide('deny', `Approval needed (${match.label}) but Telegram is not configured: ${e.message}`); }
+  try { config = loadConfig(); } catch (e) {
+    record('denied', 'error', `Telegram not configured: ${e.message}`);
+    return decide('deny', `Approval needed (${match.label}) but Telegram is not configured: ${e.message}`);
+  }
+  // Only the owner may answer. In a private chat the chat id is the owner's
+  // user id; in a group chat (negative id) any member of the chat can.
+  const fromOwner = (user) => Number(config.chat_id) < 0 || String(user && user.id) === String(config.chat_id);
 
   const telegram = createTelegramClient({ token: config.bot_token });
   const api = (method, params, httpTimeoutMs = 20000) => telegram.call(method, params, { httpTimeoutMs });
@@ -180,7 +208,7 @@ async function main() {
   const nonce = crypto.randomBytes(4).toString('hex');
   // From the environment, or, for a Claude process that stays running across messages, the daemon's current task.
   const replyTo = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || handshake.currentTaskReplyTo() || null;
-  const shown = match.text.length > 1500 ? `${match.text.slice(0, 1500)}…` : match.text;
+  const shown = shownFull.length > 1500 ? `${shownFull.slice(0, 1500)}…` : shownFull;
   const question = `🛡 <b>Approval needed</b> — ${htmlEscape(match.label)}\n<b>Tool:</b> <code>${htmlEscape(event.tool_name)}</code>\n<pre>${htmlEscape(shown)}</pre>\n`
     + `<i>Waiting ${Math.round(timeoutMs / 60000)} min, then denied. You can also reply yes / no / session / always, or 👍 / 👎.</i>`;
 
@@ -203,13 +231,17 @@ async function main() {
       ] },
     });
   } catch (e) {
+    record('denied', 'error', `Telegram request failed: ${e.message}`);
     return decide('deny', `Approval needed (${match.label}) but the Telegram request failed: ${e.message}`);
   }
+  let reminder = null;
 
-  // answer: 'y' once, 's' this session, 'a' always, 'n' deny.
-  const finish = async (answer, how) => {
+  // answer: 'y' once, 's' this session, 'a' always, 'n' deny; timedOut: nobody answered.
+  const finish = async (answer, how, timedOut = false) => {
     const allowed = answer !== 'n';
     if (answer === 's' || answer === 'a') remember(answer === 's' ? 'session' : 'always', event, match);
+    record(allowed ? 'allowed' : 'denied', timedOut ? 'timeout' : { y: 'once', s: 'session', a: 'always', n: 'once' }[answer], how);
+    if (reminder && reminder.message_id) await api('deleteMessage', { chat_id: config.chat_id, message_id: reminder.message_id }).catch(() => {});
     const scope = answer === 's' ? ' for this session' : answer === 'a' ? ' — always' : '';
     const verdict = allowed ? `✅ <b>Allowed${scope}</b>` : '❌ <b>Denied</b>';
     await api('editMessageText', {
@@ -226,7 +258,16 @@ async function main() {
   try { offset = JSON.parse(fs.readFileSync(path.join(ROOT, '.telegram-task-state.json'), 'utf-8')).updateOffset || 0; } catch (_) {}
   const textAnswer = (text) => (YES.test(text) ? 'y' : SESSION.test(text) ? 's' : ALWAYS.test(text) ? 'a' : NO.test(text) ? 'n' : null);
   const deadline = Date.now() + timeoutMs;
+  // One nudge before the question expires, when there is time for one.
+  const remindAt = timeoutMs >= 2 * REMIND_BEFORE_MS ? deadline - REMIND_BEFORE_MS : Infinity;
   while (Date.now() < deadline) {
+    if (!reminder && Date.now() >= remindAt) {
+      reminder = await api('sendMessage', {
+        chat_id: config.chat_id, parse_mode: 'HTML',
+        text: `⏰ <b>Still waiting for your OK</b>: ${htmlEscape(match.label)}. Denied in ${Math.max(1, Math.round((deadline - Date.now()) / 60000))} min if there is no answer.`,
+        reply_parameters: { message_id: sent.message_id, allow_sending_without_reply: true },
+      }).catch(() => ({}));
+    }
     const handoff = handshake.takeHandoff();
     if (handoff && handoff.text) {
       const answer = textAnswer(handoff.text);
@@ -243,6 +284,10 @@ async function main() {
         const cq = u.callback_query;
         const [tag, verdict, id] = String(cq.data || '').split(':');
         if (tag === 'ap' && id === nonce) {
+          if (!fromOwner(cq.from)) {
+            await api('answerCallbackQuery', { callback_query_id: cq.id, text: 'Only the bot owner can answer this.' }).catch(() => {});
+            continue;
+          }
           await api('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
           return finish(['y', 's', 'a'].includes(verdict) ? verdict : 'n', 'button');
         }
@@ -250,14 +295,14 @@ async function main() {
       }
       const m = u.message;
       if (!m || String(m.chat.id) !== String(config.chat_id)) continue;
-      const answer = m.text ? textAnswer(m.text) : null;
+      const answer = m.text && fromOwner(m.from) ? textAnswer(m.text) : null;
       if (answer != null) return finish(answer, `reply "${m.text.trim()}"`);
       // /stop, /status, new tasks, photos: the daemon's business. /stop kills
       // this whole process tree, which ends the wait as a deny.
       handshake.forwardToDaemon(m);
     }
   }
-  return finish('n', `no answer within ${Math.round(timeoutMs / 60000)} min`);
+  return finish('n', `no answer within ${Math.round(timeoutMs / 60000)} min`, true);
 }
 
 if (require.main === module) main().catch((e) => decide('deny', `Approval hook error: ${e.message}`));
