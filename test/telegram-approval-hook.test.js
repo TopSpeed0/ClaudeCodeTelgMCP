@@ -48,6 +48,7 @@ test('asks before MCP tools that write, never for Telegram tools', () => {
   assert.ok(classify('mcp__claude_ai_Gmail__send_message', { to: 'x' }, []));
   assert.equal(classify('mcp__tracker__getIssue', { key: 'ABC-1' }, []), null);
   assert.equal(classify('mcp__telegram-tg__tg_send', { text: 'hi' }, []), null);
+  assert.equal(classify('mcp__telegram-tg__tg_ask', { question: 'Should I run rm -rf /tmp/x or git push?' }, []), null);
   assert.equal(classify('Read', { file_path: 'x' }, []), null);
 });
 

@@ -99,6 +99,8 @@ This requires Node.js 22+. PowerShell/curl already use the OS cert store and are
 - Use HTML tags: `<b>bold</b>`, `<i>italic</i>`, `<code>mono</code>`, `<pre>block</pre>`, `<a href="url">link</a>`
 - Escape `<`, `>`, `&` in dynamic content as `&lt;`, `&gt;`, `&amp;`
 - NEVER use Markdown syntax (`**bold**`, `` `code` ``) — Telegram renders them as literal characters
+- Long details (logs, full lists) go in `<blockquote expandable>…</blockquote>`; times can be `<tg-time unix="…" format="r">…</tg-time>` (shown in the reader's time zone)
+- `tg_send` extras, used sparingly: `effect: "confetti"` when a long or important task finished well (`"fire"` for a big win); `copy: ["…"]` for a command or ID the user will want to paste (max 3, ≤256 chars each)
 
 **Correct:**
 ```

@@ -61,7 +61,23 @@ function takeDaemonInbox() {
   return take(DAEMON_INBOX_FILE) || [];
 }
 
+// The Telegram message the daemon's current main task answers. A Claude
+// process that stays running across messages cannot learn it from its
+// environment, so the MCP server and the approval hook read it from here.
+const CURRENT_TASK_FILE = path.join(ROOT, '.telegram-current-task.json');
+
+function setCurrentTask(replyTo) {
+  try { fs.writeFileSync(CURRENT_TASK_FILE, JSON.stringify({ replyTo: replyTo == null ? null : Number(replyTo), ts: new Date().toISOString() })); }
+  catch (_) { /* threading is cosmetic */ }
+}
+
+function currentTaskReplyTo() {
+  const task = readJson(CURRENT_TASK_FILE);
+  return task && task.replyTo ? Number(task.replyTo) : null;
+}
+
 module.exports = {
-  ASK_FLAG_FILE, ASK_HANDOFF_FILE, DAEMON_INBOX_FILE,
+  ASK_FLAG_FILE, ASK_HANDOFF_FILE, DAEMON_INBOX_FILE, CURRENT_TASK_FILE,
   pidAlive, setAskFlag, askActive, handOffToAsk, takeHandoff, forwardToDaemon, takeDaemonInbox,
+  setCurrentTask, currentTaskReplyTo,
 };

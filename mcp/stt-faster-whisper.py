@@ -14,6 +14,7 @@ When auto-detect sees a second language with real probability, every segment
 is checked on its own and re-transcribed in its own language. That costs
 roughly four times as long, so single-language notes skip it.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,9 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000
+# Hint words (names of your tools and systems) that Whisper should expect,
+# passed by the daemon in STT_HOTWORDS; they help it spell jargon right.
+HOTWORDS = os.environ.get("STT_HOTWORDS", "").strip() or None
 MIXED_THRESHOLD = 0.02  # second-language probability that marks a note as mixed
 MIN_SEGMENT_SECONDS = 1.0  # shorter clips are too short to detect a language reliably
 
@@ -46,7 +50,7 @@ def transcribe_mixed(model, audio, segments, main_language):
         if len(clip) >= MIN_SEGMENT_SECONDS * SAMPLE_RATE:
             language, probability, _ = model.detect_language(clip)
             if language != main_language and probability > 0.5:
-                redo, _ = model.transcribe(clip, language=language, vad_filter=False)
+                redo, _ = model.transcribe(clip, language=language, vad_filter=False, hotwords=HOTWORDS)
                 text = " ".join(r.text.strip() for r in redo).strip() or text
                 if language not in languages:
                     languages.append(language)
@@ -65,7 +69,7 @@ def main() -> int:
     language = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
     audio = load_audio(sys.argv[1])
-    segments, info = model.transcribe(audio, language=language, vad_filter=True)
+    segments, info = model.transcribe(audio, language=language, vad_filter=True, hotwords=HOTWORDS)
     segments = list(segments)
     if language is not None:
         print(" ".join(s.text.strip() for s in segments).strip())

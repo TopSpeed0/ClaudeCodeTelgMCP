@@ -1,11 +1,11 @@
 'use strict';
 
-const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'stop', 'retry', 'usage', 'queue', 'plan', 'bg']);
+const LOCAL_COMMANDS = new Set(['help', 'status', 'model', 'mcp', 'skills', 'clear', 'new', 'stop', 'retry', 'usage', 'queue', 'plan', 'bg', 'progress']);
 // Answered the moment they arrive, even while a task runs. /bg starts its own
 // isolated session at once. Everything else (tasks and state-changing commands
 // such as /clear, /model, /retry, /plan) waits its turn in the queue, so it
 // never races the running task.
-const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'queue', 'bg']);
+const IMMEDIATE_COMMANDS = new Set(['help', 'status', 'mcp', 'skills', 'stop', 'usage', 'queue', 'bg', 'progress']);
 const COMMAND_ALIASES = { new: 'clear' };
 const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Daemon status and runtime' },
@@ -15,6 +15,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'plan', description: 'Read-only run: look and propose, change nothing' },
   { command: 'bg', description: 'Side task in its own session, in parallel' },
   { command: 'usage', description: 'Cost, turns and time: last task and today' },
+  { command: 'progress', description: 'How much live progress you see: off, quiet, normal, full' },
   { command: 'new', description: 'Start a fresh conversation (same as /clear)' },
   { command: 'model', description: 'Show or select an allowed model' },
   { command: 'mcp', description: 'Configured MCP connectors' },

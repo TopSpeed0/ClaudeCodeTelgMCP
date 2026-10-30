@@ -16,7 +16,7 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+const { createTelegramClient } = require('./telegram-client');
 const crypto = require('crypto');
 const handshake = require('./telegram-handshake');
 
@@ -77,6 +77,9 @@ function classify(toolName, input, extraPatterns) {
     const hit = rules.find(([, re]) => re.test(text));
     return hit ? { label: hit[0], text } : null;
   }
+  // The bot's own Telegram tools only talk to you; their message text may
+  // quote a risky command without running it.
+  if (/^mcp__telegram-tg__/i.test(toolName)) return null;
   if (toolName.startsWith('mcp__')) {
     const text = `${toolName} ${JSON.stringify(input || {})}`;
     if (isMcpWriteTool(toolName)) return { label: 'MCP write tool', text };
@@ -97,8 +100,64 @@ function decide(decision, reason) {
   process.exit(0);
 }
 
-const YES = /^\s*(y|yes|ok|allow|approve|approved|go|כן)\s*[.!]?\s*$/i;
-const NO = /^\s*(n|no|deny|denied|reject|stop|cancel|לא)\s*[.!]?\s*$/i;
+const YES = /^\s*(y|yes|ok|allow|approve|approved|go|כן|👍|✅)\s*[.!]?\s*$/i;
+const NO = /^\s*(n|no|deny|denied|reject|stop|cancel|לא|👎|❌)\s*[.!]?\s*$/i;
+const SESSION = /^\s*(session|this session|for this session)\s*[.!]?\s*$/i;
+const ALWAYS = /^\s*(always|always allow)\s*[.!]?\s*$/i;
+
+// Remembered approvals (.telegram-approvals.json, gitignored):
+//   sessions[<Claude session id>] = rule labels allowed for that session
+//     ("✅ This session": e.g. every git push in this conversation);
+//   always = exact actions allowed for good ("🔁 Always": the shell command
+//     text, or the MCP tool name).
+const APPROVALS_FILE = path.join(ROOT, '.telegram-approvals.json');
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+function loadApprovals() {
+  try {
+    const data = JSON.parse(fs.readFileSync(APPROVALS_FILE, 'utf-8'));
+    return { sessions: data.sessions || {}, always: Array.isArray(data.always) ? data.always : [] };
+  } catch (_) { return { sessions: {}, always: [] }; }
+}
+
+function saveApprovals(data) {
+  const now = Date.now();
+  for (const [id, entry] of Object.entries(data.sessions)) {
+    if (!entry.ts || now - Date.parse(entry.ts) > SESSION_TTL_MS) delete data.sessions[id];
+  }
+  const tmp = `${APPROVALS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, APPROVALS_FILE);
+}
+
+// What "Always" remembers: an MCP tool by name, a shell command by its exact text.
+function alwaysKey(toolName, match) {
+  return toolName.startsWith('mcp__') ? toolName : match.text.trim();
+}
+
+function rememberedAllow(event, match) {
+  const data = loadApprovals();
+  const key = alwaysKey(String(event.tool_name || ''), match);
+  const always = data.always.find(entry => entry.key === key);
+  if (always) return `you chose Always on ${String(always.added).slice(0, 10)}`;
+  const session = event.session_id && data.sessions[event.session_id];
+  if (session && Array.isArray(session.labels) && session.labels.includes(match.label)) return `you allowed "${match.label}" for this session`;
+  return null;
+}
+
+function remember(scope, event, match) {
+  const data = loadApprovals();
+  if (scope === 'session' && event.session_id) {
+    const entry = data.sessions[event.session_id] || { labels: [] };
+    if (!entry.labels.includes(match.label)) entry.labels.push(match.label);
+    entry.ts = new Date().toISOString();
+    data.sessions[event.session_id] = entry;
+  } else if (scope === 'always') {
+    const key = alwaysKey(String(event.tool_name || ''), match);
+    if (!data.always.some(entry => entry.key === key)) data.always.push({ key, label: match.label, added: new Date().toISOString() });
+  }
+  saveApprovals(data);
+}
 
 async function main() {
   let raw = '';
@@ -108,30 +167,22 @@ async function main() {
   if (settings.enabled === false) return process.exit(0);
   const match = classify(String(event.tool_name || ''), event.tool_input, Array.isArray(settings.extra_patterns) ? settings.extra_patterns : []);
   if (!match) return process.exit(0);
+  const remembered = rememberedAllow(event, match);
+  if (remembered) return decide('allow', `Allowed without asking: ${remembered}.`);
 
   const timeoutMs = Math.max(30, Math.min(3600, Number(settings.timeout_seconds) || 600)) * 1000;
   let config;
   try { config = loadConfig(); } catch (e) { return decide('deny', `Approval needed (${match.label}) but Telegram is not configured: ${e.message}`); }
 
-  const api = (method, params, httpTimeoutMs = 20000) => new Promise((resolve, reject) => {
-    const body = JSON.stringify(params);
-    const req = https.request({
-      hostname: 'api.telegram.org', port: 443, path: `/bot${config.bot_token}/${method}`, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let data = ''; res.on('data', c => data += c);
-      res.on('end', () => { try { const p = JSON.parse(data); p.ok ? resolve(p.result) : reject(new Error(`${method}: ${p.description}`)); } catch (e) { reject(e); } });
-    });
-    req.on('error', reject);
-    req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`${method} timeout`)));
-    req.end(body);
-  });
+  const telegram = createTelegramClient({ token: config.bot_token });
+  const api = (method, params, httpTimeoutMs = 20000) => telegram.call(method, params, { httpTimeoutMs });
 
   const nonce = crypto.randomBytes(4).toString('hex');
-  const replyTo = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
+  // From the environment, or, for a Claude process that stays running across messages, the daemon's current task.
+  const replyTo = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || handshake.currentTaskReplyTo() || null;
   const shown = match.text.length > 1500 ? `${match.text.slice(0, 1500)}…` : match.text;
   const question = `🛡 <b>Approval needed</b> — ${htmlEscape(match.label)}\n<b>Tool:</b> <code>${htmlEscape(event.tool_name)}</code>\n<pre>${htmlEscape(shown)}</pre>\n`
-    + `<i>Waiting ${Math.round(timeoutMs / 60000)} min, then denied. You can also reply yes / no.</i>`;
+    + `<i>Waiting ${Math.round(timeoutMs / 60000)} min, then denied. You can also reply yes / no / session / always, or 👍 / 👎.</i>`;
 
   handshake.setAskFlag(true);
   process.on('exit', () => handshake.setAskFlag(false));
@@ -140,14 +191,27 @@ async function main() {
     sent = await api('sendMessage', {
       chat_id: config.chat_id, text: question, parse_mode: 'HTML',
       reply_parameters: replyTo ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
-      reply_markup: { inline_keyboard: [[{ text: '✅ Allow', callback_data: `ap:y:${nonce}` }, { text: '❌ Deny', callback_data: `ap:n:${nonce}` }]] },
+      reply_markup: { inline_keyboard: [
+        [
+          { text: '✅ Allow once', callback_data: `ap:y:${nonce}`, style: 'success' },
+          { text: '✅ This session', callback_data: `ap:s:${nonce}`, style: 'success' },
+        ],
+        [
+          { text: '🔁 Always', callback_data: `ap:a:${nonce}`, style: 'primary' },
+          { text: '❌ Deny', callback_data: `ap:n:${nonce}`, style: 'danger' },
+        ],
+      ] },
     });
   } catch (e) {
     return decide('deny', `Approval needed (${match.label}) but the Telegram request failed: ${e.message}`);
   }
 
-  const finish = async (allowed, how) => {
-    const verdict = allowed ? '✅ <b>Allowed</b>' : '❌ <b>Denied</b>';
+  // answer: 'y' once, 's' this session, 'a' always, 'n' deny.
+  const finish = async (answer, how) => {
+    const allowed = answer !== 'n';
+    if (answer === 's' || answer === 'a') remember(answer === 's' ? 'session' : 'always', event, match);
+    const scope = answer === 's' ? ' for this session' : answer === 'a' ? ' — always' : '';
+    const verdict = allowed ? `✅ <b>Allowed${scope}</b>` : '❌ <b>Denied</b>';
     await api('editMessageText', {
       chat_id: config.chat_id, message_id: sent.message_id, parse_mode: 'HTML',
       text: `${verdict} — ${htmlEscape(match.label)}\n<pre>${htmlEscape(shown)}</pre>\n<i>${htmlEscape(how)}</i>`,
@@ -160,7 +224,7 @@ async function main() {
   // Start after everything the daemon already confirmed, so no update is skipped.
   let offset = 0;
   try { offset = JSON.parse(fs.readFileSync(path.join(ROOT, '.telegram-task-state.json'), 'utf-8')).updateOffset || 0; } catch (_) {}
-  const textAnswer = (text) => (YES.test(text) ? true : NO.test(text) ? false : null);
+  const textAnswer = (text) => (YES.test(text) ? 'y' : SESSION.test(text) ? 's' : ALWAYS.test(text) ? 'a' : NO.test(text) ? 'n' : null);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const handoff = handshake.takeHandoff();
@@ -180,7 +244,7 @@ async function main() {
         const [tag, verdict, id] = String(cq.data || '').split(':');
         if (tag === 'ap' && id === nonce) {
           await api('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
-          return finish(verdict === 'y', 'button');
+          return finish(['y', 's', 'a'].includes(verdict) ? verdict : 'n', 'button');
         }
         continue; // someone else's buttons (an old tg_ask); not ours to answer
       }
@@ -193,9 +257,9 @@ async function main() {
       handshake.forwardToDaemon(m);
     }
   }
-  return finish(false, `no answer within ${Math.round(timeoutMs / 60000)} min`);
+  return finish('n', `no answer within ${Math.round(timeoutMs / 60000)} min`);
 }
 
 if (require.main === module) main().catch((e) => decide('deny', `Approval hook error: ${e.message}`));
 
-module.exports = { classify };
+module.exports = { classify, alwaysKey };

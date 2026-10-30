@@ -28,7 +28,8 @@ if (!process.execArgv.includes('--use-system-ca')) {
 
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+const { createTelegramClient } = require('./telegram-client');
+const { MESSAGE_EFFECTS, copyKeyboard, choiceStyle, htmlPage } = require('./telegram-ui');
 const readline = require('readline');
 
 // ---------- Config ----------
@@ -74,104 +75,14 @@ function saveState() {
   try { fs.writeFileSync(stateFile, JSON.stringify({ updateOffset })); } catch (_) {}
 }
 
-// ---------- Telegram API helper ----------
-function tgApi(method, params, { httpTimeoutMs } = {}) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify(params || {});
-    const urlPath = `/bot${config.bot_token}/${method}`;
-    const req = https.request({
-      hostname: 'api.telegram.org',
-      port: 443,
-      path: urlPath,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (!parsed.ok) {
-            reject(new Error(`Telegram ${method} failed: ${parsed.description || data}`));
-          } else {
-            resolve(parsed.result);
-          }
-        } catch (e) {
-          reject(new Error(`Telegram ${method} parse error: ${e.message} (raw: ${data.slice(0, 200)})`));
-        }
-      });
-    });
-    req.on('error', reject);
-    if (httpTimeoutMs) {
-      req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`Telegram ${method} HTTP timeout after ${httpTimeoutMs}ms`)));
-    }
-    req.write(body);
-    req.end();
-  });
-}
-
-// ---------- Multipart file upload helper ----------
-// Telegram file-sending endpoints (sendDocument/sendPhoto/...) need
-// multipart/form-data, not JSON. Node's built-in https can do this with no deps.
-function tgApiMultipart(method, fields, fileField, filePath, { httpTimeoutMs } = {}) {
-  return new Promise((resolve, reject) => {
-    let fileBuf;
-    try {
-      fileBuf = fs.readFileSync(filePath);
-    } catch (e) {
-      return reject(new Error(`Cannot read file "${filePath}": ${e.message}`));
-    }
-    const filename = path.basename(filePath);
-    const boundary = '----telegramTgBoundary' + Date.now() + Math.random().toString(16).slice(2);
-    const pre = [];
-    for (const [k, v] of Object.entries(fields)) {
-      if (v === undefined || v === null) continue;
-      pre.push(`--${boundary}\r\n`);
-      pre.push(`Content-Disposition: form-data; name="${k}"\r\n\r\n`);
-      pre.push(`${v}\r\n`);
-    }
-    pre.push(`--${boundary}\r\n`);
-    pre.push(`Content-Disposition: form-data; name="${fileField}"; filename="${filename}"\r\n`);
-    pre.push('Content-Type: application/octet-stream\r\n\r\n');
-    const head = Buffer.from(pre.join(''), 'utf-8');
-    const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8');
-    const body = Buffer.concat([head, fileBuf, tail]);
-    const req = https.request({
-      hostname: 'api.telegram.org',
-      port: 443,
-      path: `/bot${config.bot_token}/${method}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length,
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (!parsed.ok) {
-            reject(new Error(`Telegram ${method} failed: ${parsed.description || data}`));
-          } else {
-            resolve(parsed.result);
-          }
-        } catch (e) {
-          reject(new Error(`Telegram ${method} parse error: ${e.message} (raw: ${data.slice(0, 200)})`));
-        }
-      });
-    });
-    req.on('error', reject);
-    if (httpTimeoutMs) {
-      req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`Telegram ${method} HTTP timeout after ${httpTimeoutMs}ms`)));
-    }
-    req.write(body);
-    req.end();
-  });
-}
+// ---------- Telegram API ----------
+// Shared client (telegram-client.js): timeouts, retries, 429 handling.
+const telegram = createTelegramClient({
+  token: config.bot_token,
+  log: (msg) => process.stderr.write(`[telegram-tg] ${msg}\n`),
+});
+function tgApi(method, params, options) { return telegram.call(method, params, options); }
+function tgApiMultipart(method, fields, fileField, filePath, options) { return telegram.multipart(method, fields, fileField, filePath, options); }
 
 // Pick the right Telegram method + form field based on file extension.
 function pickFileMethod(filePath) {
@@ -183,18 +94,22 @@ function pickFileMethod(filePath) {
   return { method: 'sendDocument', field: 'document' };
 }
 
-// Set by the task daemon: the Telegram message this Claude task answers. The
-// first tg_send to the operator chat is threaded under it, and tg_react
-// defaults to it until a newer message arrives.
-const DAEMON_REPLY_TO = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
-let pendingReplyTo = DAEMON_REPLY_TO;
-
-// Tracks the most recent inbound message id so tg_react can default to it.
-let lastReceivedMessageId = DAEMON_REPLY_TO;
-
 // Handshake with telegram-task-daemon.js: while tg_ask waits it owns getUpdates
 // and the daemon pauses; see telegram-handshake.js.
-const { setAskFlag, takeHandoff, forwardToDaemon } = require('./telegram-handshake');
+const { setAskFlag, takeHandoff, forwardToDaemon, currentTaskReplyTo } = require('./telegram-handshake');
+
+// The Telegram message the daemon's current task answers: from the
+// environment (a Claude process started for one task) or from the daemon's
+// current-task file (a Claude process that stays running across messages).
+// The first tg_send of each task is threaded under it, and tg_react
+// defaults to it.
+const ENV_REPLY_TO = Number(process.env.TELEGRAM_REPLY_TO_MESSAGE_ID) || null;
+const UNDER_DAEMON = Boolean(ENV_REPLY_TO || process.env.TELEGRAM_UNDER_DAEMON);
+function taskReplyTo() { return ENV_REPLY_TO || (UNDER_DAEMON ? currentTaskReplyTo() : null); }
+let threadedTask = null; // the task whose first tg_send is already threaded
+
+// Tracks the most recent inbound message id so tg_react can default to it.
+let lastReceivedMessageId = null;
 const { isImmediateCommand } = require('./telegram-command-router');
 
 process.on('exit', () => setAskFlag(false));
@@ -219,9 +134,10 @@ function normalizeParseMode(parseMode) {
 let typingKeeperTimer = null;
 function startTypingKeeper(chatId) {
   stopTypingKeeper();
+  if (UNDER_DAEMON) return; // the task daemon already keeps "typing…" alive
   const target = chatId || config.chat_id;
   const pulse = () => {
-    tgApi('sendChatAction', { chat_id: target, action: 'typing' }).catch(() => {});
+    tgApi('sendChatAction', { chat_id: target, action: 'typing' }, { lowPriority: true }).catch(() => {});
   };
   pulse();
   let elapsed = 0;
@@ -244,9 +160,13 @@ async function tgSend(text, parseMode, opts = {}) {
   stopTypingKeeper();
   const chatId = opts.chat_id || config.chat_id;
   const pm = normalizeParseMode(parseMode);
-  const replyTo = pendingReplyTo != null && String(chatId) === String(config.chat_id) && opts.thread_id == null
-    ? { message_id: pendingReplyTo, allow_sending_without_reply: true }
+  const task = taskReplyTo();
+  const replyTo = task != null && task !== threadedTask && String(chatId) === String(config.chat_id) && opts.thread_id == null
+    ? { message_id: task, allow_sending_without_reply: true }
     : undefined;
+  const effect = opts.effect ? MESSAGE_EFFECTS[String(opts.effect).toLowerCase()] : undefined;
+  if (opts.effect && !effect) throw new Error(`Unknown effect "${opts.effect}". Use one of: ${Object.keys(MESSAGE_EFFECTS).join(', ')}.`);
+  const keyboard = copyKeyboard(opts.copy);
 
   // File attachment path: pick method by extension and multipart-upload.
   if (opts.file_path) {
@@ -255,9 +175,11 @@ async function tgSend(text, parseMode, opts = {}) {
     if (opts.thread_id != null) fields.message_thread_id = opts.thread_id;
     if (text) fields.caption = text;
     if (pm) fields.parse_mode = pm;
-    if (replyTo) fields.reply_parameters = JSON.stringify(replyTo);
+    if (replyTo) fields.reply_parameters = replyTo;
+    if (effect) fields.message_effect_id = effect;
+    if (keyboard) fields.reply_markup = keyboard;
     const msg = await tgApiMultipart(method, fields, field, opts.file_path, { httpTimeoutMs: 120000 });
-    if (replyTo) pendingReplyTo = null;
+    if (replyTo) threadedTask = replyTo.message_id;
     return `Sent file via ${method} (message_id=${msg.message_id}).`;
   }
 
@@ -269,31 +191,37 @@ async function tgSend(text, parseMode, opts = {}) {
   if (opts.thread_id != null) payload.message_thread_id = opts.thread_id;
   if (pm) payload.parse_mode = pm;
   if (replyTo) payload.reply_parameters = replyTo;
+  if (effect) payload.message_effect_id = effect;
+  if (keyboard) payload.reply_markup = keyboard;
   let msg;
   try {
     msg = await tgApi('sendMessage', payload);
   } catch (e) {
-    if (!/too long/i.test(e.message)) throw e;
-    return sendAsPage(text, pm, chatId, opts, replyTo);
+    // Effects work in private chats only; send without one rather than fail.
+    if (effect && /effect/i.test(e.message)) {
+      delete payload.message_effect_id;
+      msg = await tgApi('sendMessage', payload);
+    } else {
+      if (!/too long/i.test(e.message)) throw e;
+      return sendAsPage(text, pm, chatId, opts, replyTo);
+    }
   }
-  if (replyTo) pendingReplyTo = null;
+  if (replyTo) threadedTask = replyTo.message_id;
   return `Sent (message_id=${msg.message_id}${pm ? `, parse_mode=${pm}` : ''}).`;
 }
 
 // Over Telegram's 4096-character limit: deliver the whole answer as an .html
 // page (opens rendered on the phone) instead of failing or cutting it.
 async function sendAsPage(text, pm, chatId, opts, replyTo) {
-  // Telegram HTML is a subset of HTML, so it renders as is; newlines stay line breaks.
-  const body = `<div style="white-space:pre-wrap">${pm === 'HTML' ? text : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+  const body = pm === 'HTML' ? text : text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const file = path.join(require('os').tmpdir(), `claude-answer-${Date.now()}.html`);
-  fs.writeFileSync(file, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
-    + `<body style="font-family:system-ui,sans-serif;line-height:1.5;padding:12px;max-width:900px;margin:auto">${body}</body>`);
+  fs.writeFileSync(file, htmlPage(body));
   try {
     const fields = { chat_id: chatId, caption: `📄 Full answer (${text.length.toLocaleString('en-US')} chars, too long for one message)` };
     if (opts.thread_id != null) fields.message_thread_id = opts.thread_id;
-    if (replyTo) fields.reply_parameters = JSON.stringify(replyTo);
+    if (replyTo) fields.reply_parameters = replyTo;
     const msg = await tgApiMultipart('sendDocument', fields, 'document', file, { httpTimeoutMs: 120000 });
-    if (replyTo) pendingReplyTo = null;
+    if (replyTo) threadedTask = replyTo.message_id;
     return `Text was over Telegram's 4096-char limit, so it was sent as an HTML page (message_id=${msg.message_id}). Next time keep messages shorter or put details in <blockquote expandable>.`;
   } finally {
     try { fs.unlinkSync(file); } catch (_) {}
@@ -320,7 +248,7 @@ async function tgEdit(messageId, text, parseMode, opts = {}) {
 // Defaults to the last inbound message + 👀.
 async function tgReact(messageId, emoji, opts = {}) {
   const chatId = opts.chat_id || config.chat_id;
-  const id = messageId != null ? Number(messageId) : lastReceivedMessageId;
+  const id = messageId != null ? Number(messageId) : (taskReplyTo() || lastReceivedMessageId);
   if (id == null) {
     throw new Error('tg_react: no message_id given and no message received yet this session.');
   }
@@ -401,7 +329,7 @@ async function tgAskWait(question, timeoutSeconds, parseMode, opts = {}) {
     // Inline-keyboard quick replies: one tappable button per choice.
     if (choices) {
       sendPayload.reply_markup = {
-        inline_keyboard: choices.map((c, i) => [{ text: c, callback_data: String(i) }]),
+        inline_keyboard: choices.map((c, i) => [{ text: c, callback_data: String(i), ...(choiceStyle(c) ? { style: choiceStyle(c) } : {}) }]),
       };
     }
     const sent = await tgApi('sendMessage', sendPayload);
@@ -488,6 +416,8 @@ const TOOLS = [
         file_path:  { type: 'string', description: 'Optional absolute path to a file to attach. Type is auto-detected: .png/.jpg/.webp/.gif → photo, .mp4/.mov → video, .ogg → voice, .mp3/.m4a/.wav → audio, anything else → document.' },
         chat_id:    { type: 'string', description: 'Optional target chat id. Defaults to the configured operator chat.' },
         thread_id:  { type: 'number', description: 'Optional Telegram Topic (message_thread_id) to post into.' },
+        effect:     { type: 'string', enum: Object.keys(MESSAGE_EFFECTS), description: 'Optional full-screen animation on the message. Use sparingly: "confetti" when a long or important task finished well, "fire" for a big win; "like", "heart", "dislike", "poop" also exist. Private chats only.' },
+        copy:       { type: 'array', items: { type: 'string' }, description: 'Optional texts (max 3, each 1-256 chars) shown as one-tap "📋 Copy" buttons under the message, e.g. a command or ID the user will want to paste.' },
       },
       required: ['text'],
     },
@@ -579,6 +509,8 @@ async function handle(req) {
           file_path: args.file_path,
           chat_id: args.chat_id,
           thread_id: args.thread_id,
+          effect: args.effect,
+          copy: args.copy,
         });
       } else if (name === 'tg_ask') {
         text = await tgAsk(args.question ? String(args.question) : '', args.timeoutSeconds, args.parse_mode, {

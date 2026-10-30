@@ -18,6 +18,9 @@ agent-runtime.json
 .telegram-ask.active
 .telegram-ask-handoff.json
 .telegram-daemon-inbox.json
+.telegram-approvals.json
+.telegram-current-task.json
+.telegram-approvals.json.tmp
 mcp/daemon-settings.local.json
 
 # Photos, files and voice notes received on Telegram
@@ -29,6 +32,7 @@ archive/
 # Daemon logs
 mcp/task-daemon.log
 mcp/task-daemon.log.err
+mcp/task-daemon.log*.prev
 
 # OS / editor
 .DS_Store

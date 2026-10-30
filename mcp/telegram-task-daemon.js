@@ -23,6 +23,8 @@ const {
 } = require('./telegram-command-router');
 const { resolveQueueModel } = require('./queue-model');
 const handshake = require('./telegram-handshake');
+const { createTelegramClient } = require('./telegram-client');
+const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
@@ -211,34 +213,10 @@ function recoverReplyFromTranscript(sessionId) {
   return lastReply;
 }
 
-function tgApi(method, params, { httpTimeoutMs } = {}) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify(params || {});
-    const req = https.request({
-      hostname: 'api.telegram.org',
-      port: 443,
-      path: `/bot${config.bot_token}/${method}`,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (!parsed.ok) reject(new Error(`${method}: ${parsed.description || data}`));
-          else resolve(parsed.result);
-        } catch (e) {
-          reject(new Error(`${method} parse: ${e.message} raw=${data.slice(0,200)}`));
-        }
-      });
-    });
-    req.on('error', reject);
-    if (httpTimeoutMs) req.setTimeout(httpTimeoutMs, () => req.destroy(new Error(`${method} timeout`)));
-    req.write(body);
-    req.end();
-  });
-}
+// Shared client (telegram-client.js): timeouts, retries, 429 handling, and
+// one-at-a-time sends per chat.
+const telegram = createTelegramClient({ token: config.bot_token, log });
+function tgApi(method, params, options) { return telegram.call(method, params, options); }
 
 function stripAnsi(s) {
   // Drop ANSI CSI sequences (colors, cursor moves) that `claude -p` can emit.
@@ -323,17 +301,28 @@ function looksTabular(text) {
 }
 
 // replyTo threads the first chunk under the user's message; the rest follow it.
-async function sendChunked(text, { mode = 'rich', replyTo } = {}) {
+// Tasks at least this long get 🎉 confetti on the answer the daemon relays.
+const EFFECT_CONFETTI = MESSAGE_EFFECTS.confetti;
+const CONFETTI_AFTER_MS = 2 * 60 * 1000;
+
+// effect: a message effect id played on the first chunk. Short fenced code
+// blocks in a 'rich' answer become one-tap Copy buttons on the last chunk.
+// Returns true when everything was delivered. If Telegram stays unreachable
+// after the client's retries, the undelivered rest goes to the outbox (or to
+// onUnsent, when the outbox itself is resending) and false is returned.
+async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent } = {}) {
   // Telegram caps messages at 4096 chars. We leave headroom for the <pre>...</pre> wrapper.
   const MAX = 3800;
   let remaining = stripAnsi(text || '(no output)');
+  const copyMarkup = mode === 'rich' ? copyKeyboard(codeBlocks(remaining)) : undefined;
+  let effectId = effect;
   const threadUnder = replyTo;
   let attachFull = null;
   if (remaining.length > MAX * 2) {
     attachFull = remaining;
     const head = remaining.slice(0, MAX - 200);
     const cutAt = head.lastIndexOf('\n\n') > MAX / 2 ? head.lastIndexOf('\n\n') : head.lastIndexOf('\n');
-    remaining = `${head.slice(0, cutAt > MAX / 2 ? cutAt : head.length)}\n\n… continued in the attached file.`;
+    remaining = `${head.slice(0, cutAt > MAX / 2 ? cutAt : head.length)}\n\n… continued in the attached page.`;
   }
 
   // In 'rich' mode, fall back to monospace if the payload looks like a table —
@@ -365,35 +354,83 @@ async function sendChunked(text, { mode = 'rich', replyTo } = {}) {
 
     // allow_sending_without_reply: a deleted original must not block the answer.
     const reply_parameters = replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined;
+    const reply_markup = remaining.length === chunk.length ? copyMarkup : undefined;
+    const payload = { chat_id: config.chat_id, text: body, parse_mode, reply_parameters, reply_markup, message_effect_id: effectId, disable_web_page_preview: true };
     try {
-      await tgApi('sendMessage', {
-        chat_id: config.chat_id,
-        text: body,
-        parse_mode,
-        reply_parameters,
-        disable_web_page_preview: true,
-      });
+      try {
+        await tgApi('sendMessage', payload);
+      } catch (e) {
+        // Formatting Telegram rejected (unbalanced tags from a half-baked
+        // Markdown conversion, etc.): resend this chunk as plain text. Any
+        // other error is a delivery problem, handled below.
+        if (!e.isParseError) throw e;
+        log(`sendMessage HTML rejected (${e.message}) — resending plain`);
+        await tgApi('sendMessage', { ...payload, text: chunk, parse_mode: undefined });
+      }
     } catch (e) {
-      // Fallback to plain text if Telegram rejected the HTML for any reason
-      // (unbalanced tags from a half-baked Markdown conversion, etc.).
-      log(`sendMessage HTML failed (${e.message}) — retrying plain`);
-      await tgApi('sendMessage', {
-        chat_id: config.chat_id,
-        text: chunk,
-        reply_parameters,
-        disable_web_page_preview: true,
-      });
+      log(`sendMessage failed after retries (${e.message}) — keeping the rest for later`);
+      const rest = attachFull || remaining;
+      if (onUnsent) onUnsent(rest, { mode, replyTo });
+      else queueUnsent(rest, { mode, replyTo });
+      return false;
     }
     replyTo = undefined;
+    effectId = undefined;
     remaining = remaining.slice(chunk.length);
   }
   if (attachFull) {
-    const file = path.join(require('os').tmpdir(), `claude-answer-${Date.now()}.md`);
+    const file = path.join(require('os').tmpdir(), `claude-answer-${Date.now()}.html`);
     try {
-      fs.writeFileSync(file, attachFull);
+      const page = mode === 'rich' ? markdownToTelegramHTML(attachFull) : `<pre>${htmlEscape(attachFull)}</pre>`;
+      fs.writeFileSync(file, htmlPage(page));
       await tgSendFile(file, `📄 Full answer (${attachFull.length.toLocaleString('en-US')} chars)`, threadUnder);
-    } catch (e) { log(`full answer file: ${e.message}`); }
+    } catch (e) { log(`full answer page: ${e.message}`); }
     finally { try { fs.unlinkSync(file); } catch (_) {} }
+  }
+  return true;
+}
+
+// ---------- Outbox ----------
+// Answers that could not be delivered (network down, Telegram unreachable
+// after the client's retries) are kept in state and resent every 30 s and at
+// startup, so a dropped connection no longer loses a finished answer.
+const OUTBOX_RETRY_MS = Number(process.env.TELEGRAM_OUTBOX_RETRY_MS) || 30 * 1000;
+let outboxBusy = false;
+
+function queueUnsent(text, { mode, replyTo }) {
+  state.outbox = state.outbox || [];
+  state.outbox.push({ text, mode, replyTo, ts: new Date().toISOString() });
+  saveState();
+  log(`outbox: kept an undelivered answer (${text.length} chars); ${state.outbox.length} waiting`);
+}
+
+async function flushOutbox() {
+  if (outboxBusy || !state.outbox || !state.outbox.length) return;
+  outboxBusy = true;
+  try {
+    while (state.outbox.length) {
+      const item = state.outbox[0];
+      const lateText = 'Delivered late: the connection to Telegram was down.';
+      const note = item.late ? ''
+        : item.mode === 'html' ? `📬 <i>${lateText}</i>\n\n`
+        : item.mode === 'rich' ? `📬 _${lateText}_\n\n` : `📬 ${lateText}\n\n`;
+      let rest = null;
+      const ok = await sendChunked(note + item.text, {
+        mode: item.mode, replyTo: item.replyTo,
+        onUnsent: (unsent) => { rest = unsent; },
+      });
+      if (!ok) {
+        // Still down. Keep only what did not go out, so nothing is sent twice.
+        state.outbox[0] = { ...item, text: rest && rest.startsWith(note) ? rest.slice(note.length) : (rest || item.text), late: item.late || (rest !== note + item.text) };
+        saveState();
+        return;
+      }
+      state.outbox.shift();
+      saveState();
+      log(`outbox: delivered a late answer; ${state.outbox.length} waiting`);
+    }
+  } finally {
+    outboxBusy = false;
   }
 }
 
@@ -505,7 +542,7 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, rep
     if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
     args.push(...extraArgs);
     log(`spawn: native=${path.basename(CLAUDE_EXECUTABLE)} model=${model} prompt_chars=${task.length}${oversized ? ' via=stdin' : ''}${permissionMode ? ` mode=${permissionMode}` : ''}`);
-    const env = { ...process.env };
+    const env = { ...process.env, TELEGRAM_UNDER_DAEMON: '1' };
     delete env.TELEGRAM_REPLY_TO_MESSAGE_ID;
     if (replyTo != null) env.TELEGRAM_REPLY_TO_MESSAGE_ID = String(replyTo);
     const proc = spawn(CLAUDE_EXECUTABLE, args,
@@ -607,6 +644,147 @@ function formatUsage() {
     + `<b>Today</b>\n${today}\n\n<i>Cost is Claude's API-equivalent figure.</i>`;
 }
 
+// ---------- Warm Claude (main conversation) ----------
+// Starting Claude Code costs 15-20 s (skills, plugins, MCP servers) before it
+// reads a word, so the main conversation keeps one Claude running between
+// messages and feeds each message to it over stdin (stream-json). Follow-ups
+// then start in about a second. The process is replaced when the session or
+// model changes, and closed by /new, a rotation, a read-only (/plan, voice)
+// run on the same conversation, /stop, or 30 idle minutes. Side tasks, the
+// Hermes queue and summaries still start their own process. Turn off with
+// telegram.warm: false in agent-runtime.json.
+const WARM_ENABLED = TELEGRAM_RUNTIME.warm !== false;
+const WARM_IDLE_MS = 30 * 60 * 1000;
+let warm = null; // { proc, sessionId, model, buf, turn, lastCost, errOut, used, idleTimer }
+
+function startWarm(sessionId, resuming, model) {
+  const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+    '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--dangerously-skip-permissions'];
+  if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
+  if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
+  if (CLAUDE_RUNTIME.chrome === true) args.push('--chrome');
+  args.push(...(resuming ? ['--resume', sessionId] : ['--session-id', sessionId]));
+  log(`warm: starting Claude (${resuming ? 'resume' : 'new'} session ${sessionId}, model ${model})`);
+  const env = { ...process.env, TELEGRAM_UNDER_DAEMON: '1' };
+  delete env.TELEGRAM_REPLY_TO_MESSAGE_ID; // per message: see handshake.setCurrentTask
+  const proc = spawn(CLAUDE_EXECUTABLE, args, { cwd: WORKDIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const w = { proc, sessionId, model: String(model), buf: '', turn: null, lastCost: 0, errOut: '', used: false, idleTimer: null };
+  const finishTurn = (result) => {
+    const turn = w.turn;
+    if (!turn) return;
+    w.turn = null;
+    clearTimeout(turn.timer);
+    turn.resolve({ errOut: w.errOut, killed: turn.killed, stopped: turn.stopped, ...result });
+  };
+  proc.stdout.on('data', (d) => {
+    w.buf += d.toString();
+    let nl;
+    while ((nl = w.buf.indexOf('\n')) >= 0) {
+      const line = w.buf.slice(0, nl).trim();
+      w.buf = w.buf.slice(nl + 1);
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line); } catch (_) { continue; }
+      if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) w.sessionId = ev.session_id;
+      if (ev.type === 'result') {
+        // total_cost_usd adds up over the process's life; /usage wants this message's share.
+        const cost = Number(ev.total_cost_usd) || 0;
+        const envelope = { ...ev, total_cost_usd: Math.max(0, cost - w.lastCost) };
+        w.lastCost = cost;
+        finishTurn({ code: ev.is_error ? 1 : 0, out: JSON.stringify(envelope) });
+        armWarmIdle(w);
+      } else if (w.turn && w.turn.onEvent) {
+        try { w.turn.onEvent(ev); } catch (e) { log(`progress: ${e.message}`); }
+      }
+    }
+  });
+  proc.stderr.on('data', (d) => { w.errOut = (w.errOut + d.toString()).slice(-4000); });
+  proc.stdin.on('error', (e) => log(`warm stdin: ${e.code || e.message}`));
+  proc.on('error', (e) => { if (warm === w) warm = null; finishTurn({ code: -1, out: '', errOut: `spawn error: ${e.message}` }); });
+  proc.on('close', (code) => {
+    if (warm === w) warm = null;
+    clearTimeout(w.idleTimer);
+    log(`warm: Claude exited (code ${code})`);
+    finishTurn({ code: code == null ? -1 : code, out: '' });
+  });
+  return w;
+}
+
+function armWarmIdle(w) {
+  clearTimeout(w.idleTimer);
+  w.idleTimer = setTimeout(() => { if (warm === w && !w.turn) closeWarm('idle for 30 min'); }, WARM_IDLE_MS);
+}
+
+function closeWarm(reason) {
+  const w = warm;
+  if (!w) return;
+  warm = null;
+  clearTimeout(w.idleTimer);
+  log(`warm: closing Claude (${reason})`);
+  try { w.proc.stdin.end(); } catch (_) {}
+  setTimeout(() => { if (w.proc.exitCode == null) killTree(w.proc); }, 5000);
+}
+
+// Starts Claude ahead of the first message, so even that one is quick.
+function prewarm() {
+  if (!WARM_ENABLED || warm) return;
+  if (state.sessionId) warm = startWarm(state.sessionId, true, CLAUDE_RUNTIME.model);
+  else warm = startWarm(crypto.randomUUID(), false, CLAUDE_RUNTIME.model);
+  armWarmIdle(warm);
+}
+
+// One message to the warm Claude; resolves like claudeRaw.
+function warmTurn(prompt, { sessionId, resuming, model, onEvent, onSpawn, replyTo }) {
+  return new Promise((resolve) => {
+    if (warm && (warm.model !== String(model) || warm.sessionId !== sessionId || warm.turn)) closeWarm('different session or model');
+    if (!warm) warm = startWarm(sessionId, resuming, model);
+    const w = warm;
+    clearTimeout(w.idleTimer);
+    w.used = true;
+    handshake.setCurrentTask(replyTo);
+    const turn = { resolve, onEvent, stopped: false, killed: false };
+    turn.timer = setTimeout(() => {
+      turn.killed = true;
+      log(`timeout: killing warm Claude after ${CLAUDE_TIMEOUT_MS / 1000}s`);
+      killTree(w.proc);
+    }, CLAUDE_TIMEOUT_MS);
+    w.turn = turn;
+    // /stop sees the same shape as a spawned run: { proc, stopped }.
+    if (onSpawn) onSpawn({ proc: w.proc, get stopped() { return turn.stopped; }, set stopped(v) { turn.stopped = v; } });
+    try {
+      w.proc.stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } })}\n`);
+    } catch (e) {
+      w.turn = null;
+      clearTimeout(turn.timer);
+      resolve({ code: -1, out: '', errOut: `warm write: ${e.message}`, killed: false, stopped: false });
+    }
+  });
+}
+
+// ---------- Conversation rotation ----------
+// A conversation that has grown huge makes every message slow and costly:
+// each one re-reads the whole history. When the context of the last message
+// passes the limit (telegram.rotate_tokens, default 150k), the next message
+// starts a fresh conversation; recent turns and earlier summaries from the
+// archive carry over (buildRestoreContext).
+const ROTATE_TOKENS = Number(TELEGRAM_RUNTIME.rotate_tokens) || 150000;
+
+function maybeRotate({ notify = true } = {}) {
+  const last = state.usage && state.usage.last;
+  if (!last || last.source !== 'telegram' || !state.sessionId) return false;
+  const context = (Number(last.inputTokens) + Number(last.cachedTokens)) / Math.max(1, Number(last.turns) || 1);
+  if (context < ROTATE_TOKENS) return false;
+  log(`rotation: last context ~${Math.round(context / 1000)}k tokens ≥ ${Math.round(ROTATE_TOKENS / 1000)}k — fresh conversation next`);
+  closeWarm('conversation rotated');
+  state.sessionId = null;
+  state.lastActivity = null;
+  saveState();
+  if (notify) {
+    sendChunked(`♻️ <i>Next message starts a fresh conversation: this one reached about ${Math.round(context / 1000)}k tokens, which makes every reply slow. Recent history carries over as a summary.</i>`, { mode: 'html' })
+      .catch(e => log(`rotation note: ${e.message}`));
+  }
+  return true;
+}
+
 // Run a Telegram task through Claude with our session management. Optional
 // contextPrefix is prepended (used to restore conversation context on a fork
 // or for an explicit recall). Returns { ok, text, code, forked, actualId }.
@@ -614,9 +792,11 @@ function formatUsage() {
 // onSpawn defaults to registering the main /stop target.
 async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, isolated = false, replyTo, permissionMode, onEvent, onSpawn, source } = {}) {
   const resuming = !isolated && !!state.sessionId;
+  const useWarm = WARM_ENABLED && !isolated && !permissionMode;
   // Own the session id ourselves: reuse the pinned one, or mint a UUID for a
-  // fresh session and assign it via --session-id.
-  const sessionId = isolated ? crypto.randomUUID() : (state.sessionId || crypto.randomUUID());
+  // fresh session (or take the one a pre-started warm Claude already has).
+  const sessionId = isolated ? crypto.randomUUID()
+    : (state.sessionId || (useWarm && warm && !warm.used ? warm.sessionId : crypto.randomUUID()));
   const prompt = contextPrefix ? `${contextPrefix}\n\n---\nThe user's actual message:\n${task}` : task;
   const sessionArgs = resuming ? ['--resume', sessionId] : ['--session-id', sessionId];
   // Opt-in Claude in Chrome tools for task sessions (not summaries); needs the extension connected.
@@ -625,7 +805,11 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
 
   let mainHandle = null;
   const register = onSpawn || ((handle) => { mainHandle = handle; activeTask = handle; });
-  const { code, out, errOut, killed, stopped } = await claudeRaw(prompt, sessionArgs, { model, onSpawn: register, replyTo, permissionMode, onEvent });
+  // A separate process on the same conversation must not run beside the warm one.
+  if (!isolated && !useWarm) closeWarm('a separate run on the main conversation');
+  const { code, out, errOut, killed, stopped } = useWarm
+    ? await warmTurn(prompt, { sessionId, resuming, model, onEvent, onSpawn: register, replyTo })
+    : await claudeRaw(prompt, sessionArgs, { model, onSpawn: register, replyTo, permissionMode, onEvent });
   if (mainHandle && activeTask === mainHandle) activeTask = null;
   if (stopped) return { ok: false, text: '__STOPPED__', code: -1 };
   if (killed) {
@@ -677,7 +861,8 @@ async function runClaude(task, { contextPrefix, model = CLAUDE_RUNTIME.model, is
 // Telegram's "typing..." badge lasts ~5 seconds. We re-send every 4s while Claude works.
 function startTyping() {
   const send = () => {
-    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' })
+    if (handshake.askActive()) return; // waiting for the user: "typing…" would mislead
+    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }, { lowPriority: true })
       .catch(e => log(`typing indicator: ${e.message}`));
   };
   send(); // fire immediately
@@ -694,7 +879,7 @@ function tgReact(messageId, emoji) {
     chat_id: config.chat_id,
     message_id: messageId,
     reaction: [{ type: 'emoji', emoji: emoji || '👀' }],
-  }).catch(e => log(`react: ${e.message}`));
+  }, { lowPriority: true }).catch(e => log(`react: ${e.message}`));
 }
 
 // Edit a previously sent message in place (live progress, no chat spam).
@@ -710,7 +895,7 @@ function tgEdit(messageId, text, { parse_mode } = {}) {
 
 function tgClearReaction(messageId) {
   if (messageId == null) return Promise.resolve();
-  return tgApi('setMessageReaction', { chat_id: config.chat_id, message_id: messageId, reaction: [] })
+  return tgApi('setMessageReaction', { chat_id: config.chat_id, message_id: messageId, reaction: [] }, { lowPriority: true })
     .catch(e => log(`clear reaction: ${e.message}`));
 }
 
@@ -724,59 +909,87 @@ function pickFileMethod(filePath) {
   return { method: 'sendDocument', field: 'document' };
 }
 
-// Multipart upload so the daemon can attach screenshots / logs / reports.
+// Upload a file (screenshot, log, report page), threaded under replyTo.
 function tgSendFile(filePath, caption, replyTo) {
-  return new Promise((resolve, reject) => {
-    let fileBuf;
-    try { fileBuf = fs.readFileSync(filePath); }
-    catch (e) { return reject(new Error(`Cannot read file "${filePath}": ${e.message}`)); }
-    const { method, field } = pickFileMethod(filePath);
-    const filename = path.basename(filePath);
-    const boundary = '----tgBoundary' + Date.now() + Math.random().toString(16).slice(2);
-    const fields = { chat_id: config.chat_id };
-    if (caption) fields.caption = caption;
-    if (replyTo != null) fields.reply_parameters = JSON.stringify({ message_id: replyTo, allow_sending_without_reply: true });
-    const pre = [];
-    for (const [k, v] of Object.entries(fields)) {
-      pre.push(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`);
-    }
-    pre.push(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
-    const body = Buffer.concat([
-      Buffer.from(pre.join(''), 'utf-8'),
-      fileBuf,
-      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf-8'),
-    ]);
-    const req = https.request({
-      hostname: 'api.telegram.org', port: 443,
-      path: `/bot${config.bot_token}/${method}`,
-      method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
-    }, (res) => {
-      let data = ''; res.on('data', c => data += c);
-      res.on('end', () => {
-        try { const p = JSON.parse(data); p.ok ? resolve(p.result) : reject(new Error(`${method}: ${p.description || data}`)); }
-        catch (e) { reject(new Error(`${method} parse: ${e.message}`)); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(120000, () => req.destroy(new Error(`${method} timeout`)));
-    req.write(body); req.end();
-  });
+  const { method, field } = pickFileMethod(filePath);
+  const fields = { chat_id: config.chat_id };
+  if (caption) fields.caption = caption;
+  if (replyTo != null) fields.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
+  return telegram.multipart(method, fields, field, filePath);
 }
 
 // ---------- Live status message ----------
-// One status message per task: posted silently at the first tool step (or after
-// a minute), edited in place at most every 3 s, deleted when the task ends.
-// Shows elapsed time, step count and the last three steps.
-const PROGRESS_ENABLED = TELEGRAM_RUNTIME.progress !== false;
+// One status message per task, edited in place at most every 3 s and deleted
+// when the task ends. How much of it you see is the progress mode (/progress):
+//   off     no status message (reactions still show progress)
+//   quiet   only for tasks that run 30 s or more; time and step count, no steps
+//   normal  after 10 s; time, step count and the latest step
+//   full    at the first step; time, step count and the last three steps
+// Quick answers stay clean in every mode but full. Default: quiet, or
+// telegram.progress in agent-runtime.json (true = normal, false = off).
+const PROGRESS_MODES = {
+  off: { showAfterMs: Infinity, steps: 0, label: 'no status message; reactions only' },
+  quiet: { showAfterMs: 30000, steps: 0, label: 'only for tasks over 30 s, time and step count' },
+  normal: { showAfterMs: 10000, steps: 1, label: 'after 10 s, with the latest step' },
+  full: { showAfterMs: 0, steps: 3, label: 'right away, with the last three steps' },
+};
+function defaultProgressMode() {
+  const configured = TELEGRAM_RUNTIME.progress;
+  if (configured === false) return 'off';
+  if (configured === true) return 'normal';
+  return PROGRESS_MODES[configured] ? configured : 'quiet';
+}
+function progressMode() {
+  return PROGRESS_MODES[state.progressMode] ? state.progressMode : defaultProgressMode();
+}
 
+// /progress: show the mode with a button per mode, or set it by name.
+function progressCommand(argument) {
+  const wanted = String(argument || '').trim().toLowerCase();
+  if (wanted) {
+    if (!PROGRESS_MODES[wanted]) return { text: `Unknown mode <code>${htmlEscape(wanted)}</code>. Use off, quiet, normal or full.` };
+    state.progressMode = wanted;
+    saveState();
+  }
+  const current = progressMode();
+  const lines = Object.entries(PROGRESS_MODES)
+    .map(([name, mode]) => `${name === current ? '✅' : '▫️'} <b>${name}</b>: ${mode.label}`);
+  return {
+    text: `<b>⏳ Progress display</b>${wanted ? ' updated' : ''}\n\n${lines.join('\n')}\n\n<i>Tap to switch, or send /progress &lt;mode&gt;.</i>`,
+    reply_markup: { inline_keyboard: [Object.keys(PROGRESS_MODES).map(name => ({
+      text: name === current ? `✅ ${name}` : name, callback_data: `pm:${name}`, style: name === current ? 'success' : undefined,
+    }))] },
+  };
+}
+
+// A tap on a /progress button. Returns false when it was not ours.
+function progressButton(cq) {
+  const [tag, name] = String(cq.data || '').split(':');
+  if (tag !== 'pm' || !PROGRESS_MODES[name]) return false;
+  const view = progressCommand(name);
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: `Progress: ${name}` }).catch(() => {});
+  if (cq.message) {
+    tgApi('editMessageText', {
+      chat_id: config.chat_id, message_id: cq.message.message_id, parse_mode: 'HTML', text: view.text, reply_markup: view.reply_markup,
+    }, { lowPriority: true }).catch(e => log(`progress edit: ${e.message}`));
+  }
+  return true;
+}
+
+// A plain-language step. Shell steps use the description Claude gives each
+// command ("Check the daemon log"); without one, the command without a
+// leading "cd <folder> &&".
 function toolLine(name, input) {
   const i = input || {};
   const file = (p) => `<code>${htmlEscape(path.basename(String(p || '')))}</code>`;
   const one = (s, max = 70) => `<code>${htmlEscape(shorten(String(s || '').split('\n')[0], max))}</code>`;
   if (/^mcp__telegram-tg__/.test(name) || /^(TodoWrite|ToolSearch|ExitPlanMode|EnterPlanMode)$/.test(name)) return null;
   switch (name) {
-    case 'Bash': case 'PowerShell': return `💻 ${name}: ${one(i.command)}`;
+    case 'Bash': case 'PowerShell': {
+      if (i.description) return `💻 ${htmlEscape(shorten(i.description, 70))}`;
+      const command = String(i.command || '').replace(/^\s*(?:cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*)+/i, '');
+      return `💻 ${one(command)}`;
+    }
     case 'Read': return `📖 Read ${file(i.file_path)}`;
     case 'Write': return `📝 Write ${file(i.file_path)}`;
     case 'Edit': case 'MultiEdit': case 'NotebookEdit': return `✏️ Edit ${file(i.file_path || i.notebook_path)}`;
@@ -794,23 +1007,35 @@ function toolLine(name, input) {
   }
 }
 
-function startStatus(replyTo, { title = 'Working' } = {}) {
+// <tg-time> renders a moment in the reader's own time zone; format "r" is
+// relative ("5 minutes ago"), "t" a clock time, "wDT" weekday + date + time.
+function tgTime(ms, format, fallback) {
+  return `<tg-time unix="${Math.floor(ms / 1000)}" format="${format}">${htmlEscape(fallback)}</tg-time>`;
+}
+
+// workingReaction: swapped onto the user's message at the first tool step,
+// so 👀 (seen) turns into 👨‍💻 (actively working). The mode is read once per
+// task, so a /progress change applies from the next task.
+function startStatus(replyTo, { title = 'Working', workingReaction } = {}) {
   const t0 = Date.now();
+  const mode = PROGRESS_MODES[progressMode()];
   const steps = [];
   let count = 0, messageId = null, creating = false, stopped = false, lastSent = '', editTimer = null;
   const render = () => {
     const secs = Math.floor((Date.now() - t0) / 1000);
-    const extra = [secs >= 60 ? `${Math.floor(secs / 60)} min` : `${secs} s`];
+    const extra = [`started ${tgTime(t0, 'r', secs >= 60 ? `${Math.floor(secs / 60)} min ago` : 'just now')}`];
     if (count) extra.push(`${count} step${count === 1 ? '' : 's'}`);
     if (state.queue.length) extra.push(`${state.queue.length} queued`);
-    const lines = [`⏳ <b>${htmlEscape(title)}</b> — ${extra.join(' · ')}`, ...steps];
+    // The minute count keeps the text changing, so the periodic edit is not a no-op.
+    const shownSteps = mode.steps ? steps.slice(-mode.steps) : [];
+    const lines = [`⏳ <b>${htmlEscape(title)}</b> — ${extra.join(' · ')} <i>(${Math.floor(secs / 60)}m)</i>`, ...shownSteps];
     if (handshake.askActive()) lines.push('❓ <i>Waiting for your answer above.</i>');
     lines.push('<i>/stop to cancel</i>');
     return lines.join('\n');
   };
   const flush = async () => {
     editTimer = null;
-    if (stopped) return;
+    if (stopped || Date.now() - t0 < mode.showAfterMs) return;
     const text = render();
     if (text === lastSent) return;
     try {
@@ -823,24 +1048,32 @@ function startStatus(replyTo, { title = 'Working' } = {}) {
         });
         messageId = sent.message_id;
         creating = false;
+        setRunningStatus(replyTo, messageId);
         if (stopped) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: messageId }).catch(() => {});
       } else {
-        await tgEdit(messageId, text, { parse_mode: 'HTML' });
+        await tgApi('editMessageText', { chat_id: config.chat_id, message_id: messageId, text, parse_mode: 'HTML', disable_web_page_preview: true }, { lowPriority: true });
       }
       lastSent = text;
-    } catch (e) { creating = false; log(`status: ${e.message}`); }
+    } catch (e) {
+      creating = false;
+      if (/message to edit not found|MESSAGE_ID_INVALID/i.test(e.message)) { messageId = null; lastSent = ''; }
+      else if (!/not modified/i.test(e.message)) log(`status: ${e.message}`);
+    }
   };
   const schedule = (delayMs) => { if (!editTimer && !stopped) editTimer = setTimeout(flush, delayMs); };
   const minute = setInterval(() => schedule(0), 60000);
+  // The first appearance, for modes that wait (quiet, normal).
+  const firstShow = Number.isFinite(mode.showAfterMs) && mode.showAfterMs > 0 ? setTimeout(() => schedule(0), mode.showAfterMs) : null;
   return {
     // A stream-json event from claudeRaw's onEvent.
     step(ev) {
-      if (!PROGRESS_ENABLED || !ev || ev.type !== 'assistant' || !ev.message || !Array.isArray(ev.message.content)) return;
+      if (!ev || ev.type !== 'assistant' || !ev.message || !Array.isArray(ev.message.content)) return;
       let added = false;
       for (const c of ev.message.content) {
         if (!c || c.type !== 'tool_use') continue;
         const line = toolLine(String(c.name || ''), c.input);
         if (!line) continue;
+        if (count === 0 && workingReaction) tgReact(replyTo, workingReaction);
         count++; added = true;
         steps.push(line);
         if (steps.length > 3) steps.shift();
@@ -850,6 +1083,7 @@ function startStatus(replyTo, { title = 'Working' } = {}) {
     stop() {
       stopped = true;
       clearInterval(minute);
+      if (firstShow) clearTimeout(firstShow);
       if (editTimer) clearTimeout(editTimer);
       if (messageId != null) tgApi('deleteMessage', { chat_id: config.chat_id, message_id: messageId }).catch(e => log(`status delete: ${e.message}`));
     },
@@ -905,7 +1139,7 @@ async function downloadMedia(media, msgId) {
   const dir = path.join(INBOX_DIR, localDayKey());
   fs.mkdirSync(dir, { recursive: true });
   const name = String(media.name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 120);
-  const dest = path.join(dir, name.startsWith(String(msgId)) ? name : `${msgId}-${name}`);
+  const dest = path.join(dir, name.startsWith(String(msgId).split('-')[0]) ? `${msgId}${path.extname(name)}` : `${msgId}-${name}`);
   return httpsDownload(`/file/bot${config.bot_token}/${file.file_path}`, dest);
 }
 
@@ -922,7 +1156,9 @@ function sttAvailable() {
 function transcribe(file) {
   return new Promise((resolve, reject) => {
     const script = path.join(__dirname, 'stt-faster-whisper.py');
-    const proc = spawn(PYTHON, [script, file, String(VOICE.model || 'small'), String(VOICE.language || '')], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn(PYTHON, [script, file, String(VOICE.model || 'small'), String(VOICE.language || '')], {
+      stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, STT_HOTWORDS: sttHints() },
+    });
     let out = '', err = '';
     proc.stdout.on('data', d => out += d.toString());
     proc.stderr.on('data', d => err += d.toString());
@@ -936,26 +1172,180 @@ function transcribe(file) {
   });
 }
 
-// Turns a media queue item into the task text for Claude, or { error } to reply instead.
+// ---------- Voice: understand, propose, then wait for your OK ----------
+// Speech-to-text gets roughly 3 words in 4 right, so a voice note never runs
+// as heard. Claude first reads it in read-only plan mode, corrects what was
+// probably misheard from context, and proposes a plan; the bot shows
+// Heard / You mean / Plan with ▶️ Do it · ✏️ Correct · ❌ Cancel. A typed
+// reply works too: yes / no, or a correction, which gets a new plan.
+// Turn off with telegram.voice.confirm: false.
+const VOICE_CONFIRM = VOICE.confirm !== false;
+const VOICE_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
+const VOICE_MAX_ROUNDS = 4;
+const CONFIRM_YES = /^\s*(y|yes|ok|run|do it|go|go ahead|כן|👍|✅|▶️)\s*[.!]?\s*$/i;
+const CONFIRM_NO = /^\s*(n|no|cancel|stop|לא|👎|❌)\s*[.!]?\s*$/i;
+let pendingVoice = null; // { nonce, messageId, card, resolve, timer }
+
+// Words Whisper should expect: your MCP server names and the product names in
+// your skills' descriptions (camel-case and short all-caps words such as
+// OpenShift, NetApp, ONTAP, KVM). Built fresh for each note; nothing hard-coded.
+const HINT_STOPWORDS = /^(TRIGGER|MCP|API|CLI|HTML|JSON|REST|AI|UI|UX|PDF|CSV|URL|AND|THE|FOR|USE|NOT)$/;
+function sttHints() {
+  const terms = new Set(mcpNames());
+  for (const { description } of installedSkills()) {
+    for (const word of String(description).match(/\b(?:[A-Z][a-z]+[A-Z][A-Za-z]*|[a-z]+[A-Z][A-Za-z]*|[A-Z]{2,6})\b/g) || []) {
+      if (!HINT_STOPWORDS.test(word)) terms.add(word);
+    }
+  }
+  return [...terms].join(' ').slice(0, 600);
+}
+
+function voiceCard({ transcript, meaning, plan }, footer) {
+  // The transcriber prefixes the detected language ("[en] …", "[en+he] …"); not needed on the card.
+  return `🎙 <b>Heard:</b> <i>${htmlEscape(transcript.replace(/^\[[a-z+]+\]\s*/i, ''))}</i>\n`
+    + `🧠 <b>You mean:</b> ${htmlEscape(meaning)}\n`
+    + `📋 <b>Plan:</b>\n<blockquote>${htmlEscape(plan)}</blockquote>\n${footer}`;
+}
+
+// Claude reads the note in plan mode (it can look things up, never change
+// anything) and answers MEANING / PLAN.
+async function proposeVoicePlan(msgId, transcript, correction) {
+  const prompt = '[Voice note from the user, transcribed by speech-to-text that gets roughly 3 words in 4 right. '
+    + 'Read between the lines: fix words that were probably misheard, using this conversation and the user\'s tools '
+    + '(skills, MCP servers) as context. This run is read-only: look things up if that helps, but change nothing. '
+    + 'Reply in exactly this shape and nothing else:\nMEANING: <one sentence: what the user most likely wants>\n'
+    + 'PLAN:\n1. <short step>\n2. <short step>\n(1 to 5 steps)]\n\n'
+    + `Transcript: "${transcript}"`
+    + (correction ? `\n\nThe user corrected your previous reading: "${correction}". Use that.` : '');
+  const status = startStatus(msgId, { title: 'Understanding your voice note (read-only)' });
+  let outcome;
+  try {
+    outcome = await runClaude(prompt, { permissionMode: 'plan', replyTo: msgId, source: 'voice', onEvent: (ev) => status.step(ev) });
+  } finally {
+    status.stop();
+  }
+  const { ok, text: result, actualId } = outcome;
+  if (!ok && result === '__STOPPED__') return null;
+  let answer = stripAnsi(result || '').trim();
+  if (TG_SENT_SENTINEL.test(answer)) answer = recoverReplyFromTranscript(actualId) || '';
+  if (!ok || !answer) return { transcript, meaning: correction || transcript, plan: '(Could not prepare a plan. ▶️ runs the request as heard.)' };
+  const meaning = ((answer.match(/MEANING:\s*(.+)/i) || [])[1] || answer.split('\n')[0]).trim();
+  const plan = (answer.split(/PLAN:\s*/i)[1] || '').trim() || '(no steps given)';
+  return { transcript, meaning, plan };
+}
+
+function confirmVoice(replyTo, card) {
+  return new Promise(async (resolve) => {
+    const nonce = crypto.randomBytes(4).toString('hex');
+    let sent;
+    try {
+      sent = await tgApi('sendMessage', {
+        chat_id: config.chat_id, parse_mode: 'HTML',
+        text: voiceCard(card, '<i>Nothing runs until you say so. You can also type yes / no, or a correction.</i>'),
+        reply_parameters: { message_id: replyTo, allow_sending_without_reply: true },
+        reply_markup: { inline_keyboard: [[
+          { text: '▶️ Do it', callback_data: `vc:run:${nonce}`, style: 'success' },
+          { text: '✏️ Correct', callback_data: `vc:edit:${nonce}`, style: 'primary' },
+          { text: '❌ Cancel', callback_data: `vc:cancel:${nonce}`, style: 'danger' },
+        ]] },
+      });
+    } catch (e) {
+      log(`voice confirm: ${e.message}`);
+      return resolve({ action: 'cancel', how: 'the confirmation could not be sent' });
+    }
+    const timer = setTimeout(() => settleVoice({ action: 'cancel', how: 'no answer within 10 min' }), VOICE_CONFIRM_TIMEOUT_MS);
+    pendingVoice = { nonce, messageId: sent.message_id, card, resolve, timer };
+  });
+}
+
+// Ends the pending confirmation: updates its message and releases the task.
+function settleVoice(decision) {
+  const pending = pendingVoice;
+  if (!pending) return false;
+  pendingVoice = null;
+  clearTimeout(pending.timer);
+  const footer = decision.action === 'run' ? '▶️ <b>Doing it.</b>'
+    : decision.action === 'edit' ? `✏️ <b>Your correction:</b> ${htmlEscape(decision.text)}\n<i>Re-planning…</i>`
+    : `❌ <b>Cancelled</b>: nothing was run${decision.how ? ` (${htmlEscape(decision.how)})` : ''}.`;
+  tgApi('editMessageText', {
+    chat_id: config.chat_id, message_id: pending.messageId, parse_mode: 'HTML', text: voiceCard(pending.card, footer),
+  }, { lowPriority: true }).catch(e => log(`voice confirm edit: ${e.message}`));
+  pending.resolve(decision);
+  return true;
+}
+
+// A button tap on the pending card. Returns false when it was not ours.
+function voiceButton(cq) {
+  const [tag, action, nonce] = String(cq.data || '').split(':');
+  if (tag !== 'vc' || !pendingVoice || nonce !== pendingVoice.nonce) return false;
+  if (action === 'edit') {
+    // Stays pending: the next typed message is the correction.
+    tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: '✏️ Type what you meant and send it.' }).catch(() => {});
+    return true;
+  }
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
+  settleVoice({ action: action === 'run' ? 'run' : 'cancel' });
+  return true;
+}
+
+// A typed reply while a card waits: yes / no, or a correction.
+function voiceTyped(text) {
+  if (!pendingVoice) return false;
+  if (CONFIRM_YES.test(text)) return settleVoice({ action: 'run' });
+  if (CONFIRM_NO.test(text)) return settleVoice({ action: 'cancel', how: 'you said no' });
+  return settleVoice({ action: 'edit', text });
+}
+
+// The whole voice round: plan, show, and loop on corrections. Returns the
+// task to run, or null when cancelled.
+async function interpretVoice(msgId, transcript) {
+  let correction = '';
+  for (let round = 0; round < VOICE_MAX_ROUNDS; round++) {
+    tgReact(msgId, '🤔');
+    const card = await proposeVoicePlan(msgId, transcript, correction);
+    if (!card) return null; // /stop during planning
+    const decision = await confirmVoice(msgId, card);
+    if (decision.action === 'cancel') return null;
+    if (decision.action === 'run') {
+      return '[Voice request. You proposed this reading and plan in read-only mode and the user approved it.]\n'
+        + `What they want: ${card.meaning}\nAgreed plan:\n${card.plan}\n`
+        + `(Raw transcript, about 3 words in 4 right: "${transcript}")\nCarry out the agreed plan now.`;
+    }
+    correction = decision.text;
+  }
+  await sendChunked('✏️ Too many corrections for one voice note. Please type the request instead.', { mode: 'plain', replyTo: msgId });
+  return null;
+}
+
+// Turns a media queue item into the task text for Claude, or { error } to
+// reply instead. item.media is a list: one attachment, or a whole album.
 async function buildMediaTask(item) {
-  const { media } = item;
+  const list = Array.isArray(item.media) ? item.media : [item.media];
   const caption = item.text || '';
-  const isSpeech = media.kind === 'voice' || (media.kind === 'audio' && !caption);
+  const media = list[0];
+  const isSpeech = list.length === 1 && (media.kind === 'voice' || (media.kind === 'audio' && !caption));
   if (isSpeech && !sttAvailable()) {
     return { error: '🎙 Voice notes need a speech-to-text engine (faster-whisper), which is not installed yet. Type the message instead, or ask me to install voice support.' };
   }
-  const file = await downloadMedia(media, item.msgId);
   if (isSpeech) {
-    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }).catch(() => {});
+    const file = await downloadMedia(media, item.msgId);
+    tgApi('sendChatAction', { chat_id: config.chat_id, action: 'typing' }, { lowPriority: true }).catch(() => {});
     const transcript = await transcribe(file);
-    await sendChunked(`🎙 <i>${htmlEscape(transcript)}</i>`, { mode: 'html', replyTo: item.msgId });
-    return { taskText: `${caption ? `${caption}\n\n` : ''}[Voice message from the user, transcribed locally]: ${transcript}` };
+    if (!VOICE_CONFIRM) await sendChunked(`🎙 <i>${htmlEscape(transcript)}</i>`, { mode: 'html', replyTo: item.msgId });
+    return { transcript, confirm: VOICE_CONFIRM, taskText: `${caption ? `${caption}\n\n` : ''}[Voice message from the user, transcribed locally]: ${transcript}` };
   }
-  const what = { photo: 'a photo', document: 'a file', video: 'a video', audio: 'an audio file' }[media.kind] || 'a file';
-  const ask = caption || `The user sent ${what} without a message. Look at it and respond to what it shows.`;
-  const how = media.kind === 'photo' ? 'Open it with the Read tool to see the image.' : 'Open it with the Read tool (or a suitable command for its type).';
-  return { taskText: `${ask}\n\n[Telegram attachment: ${what} saved at ${file} (${formatBytes(fs.statSync(file).size)}). ${how}]` };
+  const names = { photo: 'a photo', document: 'a file', video: 'a video', audio: 'an audio file', voice: 'a voice note' };
+  const lines = [];
+  for (const [i, entry] of list.entries()) {
+    const file = await downloadMedia(entry, list.length > 1 ? `${item.msgId}-${i + 1}` : item.msgId);
+    lines.push(`- ${names[entry.kind] || 'a file'} saved at ${file} (${formatBytes(fs.statSync(file).size)})`);
+  }
+  const what = list.length > 1 ? `${list.length} attachments (an album)` : (names[media.kind] || 'a file');
+  const ask = caption || `The user sent ${what} without a message. Look at ${list.length > 1 ? 'them' : 'it'} and respond to what ${list.length > 1 ? 'they show' : 'it shows'}.`;
+  const how = list.every(e => e.kind === 'photo') ? 'Open them with the Read tool to see the images.' : 'Open them with the Read tool (or a suitable command for the type).';
+  return { taskText: `${ask}\n\n[Telegram attachment${list.length > 1 ? 's' : ''}:\n${lines.join('\n')}\n${how}]` };
 }
+
 
 // Sentinel the agent prints to stdout when it has already delivered the answer via tg_send.
 // Daemon then suppresses the stdout relay entirely. See feedback_no_double_send_via_daemon.md.
@@ -1097,6 +1487,7 @@ function persistModelSelection(requested) {
   fs.writeFileSync(temporary, JSON.stringify(runtime, null, 2) + '\n');
   fs.renameSync(temporary, RUNTIME_CONFIG_FILE);
   CLAUDE_RUNTIME.model = model;
+  closeWarm('model changed');
   RUNTIME.agents.claude.model = model;
   state.sessionId = null;
   state.lastActivity = null;
@@ -1128,17 +1519,18 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
         + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
         + 'Reactions: ✍ queued · 👀 working · 🎉 done · 💔 failed. Only installed skills are forwarded as tasks; unknown slash commands are rejected locally.',
       queue: () => formatQueue(),
+      progress: (argument) => progressCommand(argument).text,
       usage: () => formatUsage(),
       status: () => {
         const readiness = mcp();
-        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nLive progress: <code>${PROGRESS_ENABLED ? 'on' : 'off'}</code>\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code>\nBuild: <code>${daemonBuild()}</code>`;
+        return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
       },
       model: (argument) => {
         if (!argument) return `<b>Configured model</b>: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\n<b>Allowed models</b>\n<code>${configuredModels().map(htmlEscape).join('\n')}</code>\n\nUse <code>/model &lt;name&gt;</code> to switch. This starts the next task with a fresh Claude session.`;
@@ -1174,6 +1566,7 @@ async function telegramCommand(rawText) {
       },
       stop: (argument) => stopCommand(argument),
       clear: () => {
+        closeWarm('/new');
         state.sessionId = null;
         state.lastActivity = null;
         state.contextResetAt = new Date().toISOString();
@@ -1251,7 +1644,7 @@ async function handleMessage(item) {
     if (command.skillCommand) rawText = skillTask(command.skillCommand, command.argument);
     if (command.mcpServer) rawText = `Use the "${command.mcpServer}" MCP server's tools (mcp__${command.mcpServer}__*) for this request, in preference to other tools: ${command.argument}`;
   }
-  tgReact(msgId, '👀');
+  tgReact(msgId, permissionMode === 'plan' ? '🤔' : '👀');
   if (item.media) {
     let prepared;
     try { prepared = await buildMediaTask(item); }
@@ -1267,13 +1660,22 @@ async function handleMessage(item) {
       return;
     }
     rawText = prepared.taskText;
+    if (prepared.confirm) {
+      const voiceTask = await interpretVoice(msgId, prepared.transcript);
+      if (!voiceTask) { await tgClearReaction(msgId); return; }
+      rawText = voiceTask;
+      tgReact(msgId, '👀');
+    }
   }
+  if (item.context) rawText = `${item.context}\n\n${rawText}`;
   state.lastTask = rawText;
   state.lastTaskMode = permissionMode || null;
   saveState();
   await rolloverIfNewDay();
   const stopTyping = startTyping();
-  const status = startStatus(msgId, { title: permissionMode === 'plan' ? 'Planning (read-only)' : 'Working' });
+  const status = startStatus(msgId, permissionMode === 'plan'
+    ? { title: 'Planning (read-only)' }
+    : { title: 'Working', workingReaction: '👨‍💻' });
   try {
     await runTask(rawText, msgId, Date.now(), { permissionMode, status });
   } finally {
@@ -1355,9 +1757,42 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
     // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
     // with the looksTabular() <pre> fallback inside sendChunked.
     const header = permissionMode === 'plan' ? '🧪 **Plan (read-only, nothing was changed).** Reply *go ahead* to carry it out.\n\n' : '';
-    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId });
+    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
   }
   await tgReact(msgId, '🎉');
+  maybeRotate();
+}
+
+// ---------- Restart recovery ----------
+// state.running remembers every task in flight (main queue and /bg) with its
+// status message. After a crash or restart those tasks are gone, so the
+// leftovers are tidied up and the user is told, instead of a 👀 stuck forever.
+function markRunning(msgId, info) {
+  state.running = state.running || {};
+  state.running[msgId] = { ...info, startedAt: Date.now() };
+  saveState();
+}
+function setRunningStatus(msgId, statusMessageId) {
+  if (state.running && state.running[msgId]) { state.running[msgId].statusMessageId = statusMessageId; saveState(); }
+}
+function clearRunning(msgId) {
+  if (state.running && state.running[msgId]) { delete state.running[msgId]; saveState(); }
+}
+async function recoverInterrupted() {
+  const entries = Object.entries(state.running || {});
+  if (!entries.length) return;
+  state.running = {};
+  saveState();
+  for (const [msgId, task] of entries) {
+    const id = Number(msgId);
+    log(`recovery: task ${id} (${task.kind}) was interrupted by a restart`);
+    await tgClearReaction(id);
+    if (task.statusMessageId) await tgApi('deleteMessage', { chat_id: config.chat_id, message_id: task.statusMessageId }).catch(() => {});
+    const again = task.kind === 'bg'
+      ? `Send <code>/bg ${htmlEscape(shorten(task.text, 80))}</code> to run it again.`
+      : 'Send /retry to run it again.';
+    await sendChunked(`⚠️ <b>Interrupted</b>: the bot restarted while this was running (started ${tgTime(task.startedAt, 'r', 'earlier')}). ${again}`, { mode: 'html', replyTo: id });
+  }
 }
 
 // ---------- Task queue ----------
@@ -1368,8 +1803,10 @@ let busy = false;
 let currentItem = null; // { text, msgId, startedAt }
 
 function itemLabel(item) {
-  if (item.media) return `${{ photo: '📸', voice: '🎙', audio: '🎵', video: '🎬' }[item.media.kind] || '📎'} ${item.text || item.media.name}`;
-  return item.text;
+  const media = Array.isArray(item.media) ? item.media : item.media ? [item.media] : [];
+  if (!media.length) return item.text;
+  const icon = { photo: '📸', voice: '🎙', audio: '🎵', video: '🎬' }[media[0].kind] || '📎';
+  return `${icon}${media.length > 1 ? ` ×${media.length}` : ''} ${item.text || media[0].name}`;
 }
 
 function enqueue(item) {
@@ -1393,8 +1830,10 @@ async function drainQueue() {
     const item = state.queue.shift();
     saveState();
     currentItem = { ...item, startedAt: Date.now() };
+    markRunning(item.msgId, { kind: 'main', text: itemLabel(item) });
     try { await handleMessage(item); }
     catch (e) { log(`handle: ${e.stack || e.message}`); try { await sendChunked(`Daemon error: ${e.message}`, { mode: 'plain', replyTo: item.msgId }); } catch (_) {} }
+    clearRunning(item.msgId);
     currentItem = null;
     busy = false;
   }
@@ -1410,14 +1849,15 @@ function startBgTask(argument, msgId) {
   if (bgTasks.size >= MAX_BG_TASKS) return `⚡ ${MAX_BG_TASKS} side tasks are already running. Wait for one, or <code>/stop bg</code>.`;
   const entry = { handle: null, stopped: false, text: argument, startedAt: Date.now() };
   bgTasks.set(msgId, entry);
+  markRunning(msgId, { kind: 'bg', text: argument });
   runBgTask(entry, msgId)
     .catch(e => log(`bg: ${e.stack || e.message}`))
-    .finally(() => bgTasks.delete(msgId));
+    .finally(() => { bgTasks.delete(msgId); clearRunning(msgId); });
   return '⚡ <b>Side task started</b> in its own session. The main chat stays free; <code>/stop bg</code> cancels it.';
 }
 
 async function runBgTask(entry, msgId) {
-  tgReact(msgId, '👀');
+  tgReact(msgId, '⚡');
   const status = startStatus(msgId, { title: 'Side task' });
   const t0 = Date.now();
   try {
@@ -1445,7 +1885,7 @@ async function runBgTask(entry, msgId) {
     if (!replyForArchive || TG_SENT_SENTINEL.test(replyForArchive)) replyForArchive = recoverReplyFromTranscript(actualId) || replyForArchive;
     appendArchive({ day: state.day || localDayKey(), ts: new Date().toISOString(), source: 'bg', user: `/bg ${entry.text}`, assistant: replyForArchive, sessionId: actualId });
     if (trimmed && !TG_SENT_SENTINEL.test(trimmed)) {
-      await sendChunked(`⚡ **Side task done** (${dt}s)\n\n${trimmed}`, { mode: 'rich', replyTo: msgId });
+      await sendChunked(`⚡ **Side task done** (${dt}s)\n\n${trimmed}`, { mode: 'rich', replyTo: msgId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
     }
     await tgReact(msgId, '🎉');
   } finally {
@@ -1456,7 +1896,7 @@ async function runBgTask(entry, msgId) {
 function formatQueue() {
   const lines = ['<b>📋 Queue</b>', ''];
   if (currentItem) {
-    lines.push(`▶️ <b>Running</b> (${formatUptime((Date.now() - currentItem.startedAt) / 1000)}): <i>${htmlEscape(shorten(itemLabel(currentItem)))}</i>`);
+    lines.push(`▶️ <b>Running</b> (started ${tgTime(currentItem.startedAt, 'r', `${formatUptime((Date.now() - currentItem.startedAt) / 1000)} ago`)}): <i>${htmlEscape(shorten(itemLabel(currentItem)))}</i>`);
   } else if (busy) {
     lines.push('▶️ <b>Running</b>: a Hermes queue task');
   } else {
@@ -1483,6 +1923,7 @@ function stopCommand(argument) {
     parts.push(n ? `⏹ Stopping ${n} side task(s)…` : 'No side task is running.');
     if (scope === 'bg') return parts.join('\n');
   }
+  if (settleVoice({ action: 'cancel', how: '/stop' })) parts.push('🎙 Cancelled the voice note waiting for your OK.');
   const dropAll = scope === 'all';
   const dropped = dropAll ? state.queue.splice(0) : [];
   if (dropped.length) {
@@ -1495,16 +1936,87 @@ function stopCommand(argument) {
   return parts.join('\n');
 }
 
+// ---------- Inbound batching and reply context ----------
+// Telegram splits a long paste into several messages and delivers a photo
+// album as one message per photo. Both are gathered into one task: text that
+// arrives within a short window (longer when a part looks cut at Telegram's
+// size limit), and album items that share a media_group_id.
+const PASTE_WINDOW_MS = 400;
+const SPLIT_PASTE_WINDOW_MS = 2000; // the last part was near 4096 chars, so more is likely coming
+const ALBUM_WINDOW_MS = 1200;
+let pasteBuffer = null; // { item, timer }
+const albumBuffers = new Map(); // media_group_id -> { item, timer }
+
+function flushPaste() {
+  if (!pasteBuffer) return;
+  const { item, timer } = pasteBuffer;
+  clearTimeout(timer);
+  pasteBuffer = null;
+  enqueue(item);
+}
+
+function bufferPaste(item) {
+  if (pasteBuffer) {
+    clearTimeout(pasteBuffer.timer);
+    pasteBuffer.item.text += `\n${item.text}`;
+    pasteBuffer.item.parts = (pasteBuffer.item.parts || 1) + 1;
+  } else {
+    pasteBuffer = { item: { ...item } };
+  }
+  const wait = item.text.length >= 3500 ? SPLIT_PASTE_WINDOW_MS : PASTE_WINDOW_MS;
+  pasteBuffer.timer = setTimeout(flushPaste, wait);
+}
+
+function bufferAlbum(groupId, item) {
+  const entry = albumBuffers.get(groupId);
+  if (entry) {
+    clearTimeout(entry.timer);
+    entry.item.media.push(...item.media);
+    if (!entry.item.text && item.text) entry.item.text = item.text;
+  } else {
+    albumBuffers.set(groupId, { item: { ...item, media: [...item.media] } });
+  }
+  const current = albumBuffers.get(groupId);
+  current.timer = setTimeout(() => { albumBuffers.delete(groupId); enqueue(current.item); }, ALBUM_WINDOW_MS);
+}
+
+// When you reply to (or quote part of) an earlier message, that message is
+// what "this" refers to, so it travels with the task.
+function replyContext(m) {
+  const replied = m.reply_to_message;
+  if (!replied) return '';
+  const quoted = m.quote && m.quote.text;
+  const original = quoted || replied.text || replied.caption || '';
+  if (!original.trim()) return '';
+  const who = replied.from && replied.from.is_bot ? 'your earlier message' : 'their own earlier message';
+  const clipped = original.length > 2000 ? `${original.slice(0, 2000)}…` : original;
+  return `[The user is replying to ${who}${quoted ? ' (quoting this part of it)' : ''}:]\n"""\n${clipped}\n"""`;
+}
+
+// Old buttons: a tap that arrives when no question or approval is waiting
+// for it (it timed out, or the bot restarted) is told so, and the buttons go.
+async function handleStaleButton(cq) {
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: '⌛ This button has expired.' }).catch(() => {});
+  if (cq.message && String(cq.message.chat.id) === String(config.chat_id)) {
+    tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+      .catch(e => log(`stale button: ${e.message}`));
+  }
+}
+
 // Routes one incoming Telegram message. fromAsker: it came back through the
 // daemon inbox from a waiting tg_ask / approval, so it is not their answer.
 async function dispatchMessage(m, { fromAsker = false } = {}) {
   if (!m || !m.chat) return;
   if (String(m.chat.id) !== String(config.chat_id)) { log(`ignored msg from chat ${m.chat.id}`); return; }
-  const media = mediaOf(m);
-  const text = media ? (m.caption || '') : (m.text || '');
-  if (!media && !text) return; // stickers, polls, service messages
-  if (!media) {
-    const parsed = parseTelegramCommand(text);
+  const ownMedia = mediaOf(m);
+  const text = ownMedia ? (m.caption || '') : (m.text || '');
+  if (!ownMedia && !text) return; // stickers, polls, service messages
+  // "What's in this?" as a reply to an earlier photo or file: use that attachment.
+  const repliedMedia = !ownMedia && m.reply_to_message ? mediaOf(m.reply_to_message) : null;
+  const parsed = ownMedia ? null : parseTelegramCommand(text);
+  if (!ownMedia && !parsed && voiceTyped(text)) return;
+  if (parsed || ownMedia) flushPaste(); // keep arrival order
+  if (!ownMedia) {
     // A bare MCP tap is answered at once from the discovered tool list; no Claude run.
     const mcpServer = parsed && !parsed.argument && (mcpCommandNames(mcpNames()).find(entry => entry.command === parsed.command) || {}).name;
     if (mcpServer) {
@@ -1515,7 +2027,16 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       await sendChunked(startBgTask(parsed.argument, m.message_id), { mode: 'html', replyTo: m.message_id }).catch(e => log(`bg reply: ${e.message}`));
       return;
     }
+    if (parsed && parsed.command === 'progress') {
+      const view = progressCommand(parsed.argument);
+      await tgApi('sendMessage', {
+        chat_id: config.chat_id, parse_mode: 'HTML', text: view.text, reply_markup: view.reply_markup,
+        reply_parameters: { message_id: m.message_id, allow_sending_without_reply: true },
+      }).catch(e => log(`progress reply: ${e.message}`));
+      return;
+    }
     if (isImmediateCommand(text)) {
+      tgReact(m.message_id, '🫡');
       try { await sendChunked((await telegramCommand(text)).reply, { mode: 'html', replyTo: m.message_id }); }
       catch (e) { log(`command: ${e.stack || e.message}`); }
       return;
@@ -1525,7 +2046,11 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
       catch (e) { log(`handoff: ${e.message}`); }
     }
   }
-  enqueue({ text, msgId: m.message_id, media: media || undefined });
+  const media = ownMedia || repliedMedia;
+  const item = { text, msgId: m.message_id, media: media ? [media] : undefined, context: replyContext(m) || undefined };
+  if (ownMedia && m.media_group_id) return bufferAlbum(m.media_group_id, item);
+  if (!media && !parsed && !item.context) return bufferPaste(item);
+  enqueue(item);
 }
 
 async function pollLoop() {
@@ -1542,7 +2067,7 @@ async function pollLoop() {
         offset: state.updateOffset,
         // Short polls while work runs, so a starting tg_ask takes over quickly.
         timeout: busy || bgTasks.size ? 10 : 50,
-        allowed_updates: ['message'],
+        allowed_updates: ['message', 'callback_query'],
       }, { httpTimeoutMs: 75 * 1000 });
     } catch (e) {
       // 409 Conflict = tg_ask just started polling; the loop pauses on its flag.
@@ -1555,6 +2080,7 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
+      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }
@@ -1578,6 +2104,7 @@ function setPresence(online) {
 
 async function shutdown(signal) {
   log(`${signal}, exiting`);
+  if (warm) killTree(warm.proc);
   await Promise.race([setPresence(false), new Promise(r => setTimeout(r, 3000))]);
   releaseLock();
   process.exit(0);
@@ -1646,5 +2173,11 @@ registerTelegramCommandMenu()
   .catch(e => log(`menu/MCP discovery: ${e.message}`));
 setPresence(true);
 setInterval(() => setPresence(true), PRESENCE_EVERY_MS);
+setInterval(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)), OUTBOX_RETRY_MS);
+maybeRotate({ notify: false });
+recoverInterrupted()
+  .catch(e => log(`recovery: ${e.message}`))
+  .then(() => prewarm())
+  .then(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)));
 pollLoop().catch(async (e) => { log(`fatal: ${e.stack || e.message}`); await setPresence(false); releaseLock(); process.exit(1); });
 hermesQueuePoll();
