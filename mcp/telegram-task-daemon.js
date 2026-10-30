@@ -783,6 +783,36 @@ function startFreshConversation(reason) {
   saveState();
 }
 
+// /compact: Claude Code's own compaction of the pinned session, run headless
+// ("claude -p /compact --resume <id>"). Unlike /refresh it keeps what Claude
+// learned from tool calls, folded into its summary, and the session id stays.
+// The warm Claude holds the same session, so it is closed first; the next
+// message starts a new one on the compacted history.
+async function compactConversation() {
+  const sessionId = state.sessionId;
+  if (!sessionId) return 'Nothing to compact: the next message starts a new conversation.';
+  const before = sessionContextTokens(sessionId);
+  const w = warm;
+  closeWarm('/compact');
+  if (w && w.proc.exitCode == null) await Promise.race([new Promise(r => w.proc.once('exit', r)), new Promise(r => setTimeout(r, 6000))]);
+  let handle = null;
+  const { code, out } = await claudeRaw('/compact', ['--resume', sessionId], {
+    nativeMcp: false, onSpawn: (h) => { handle = h; activeTask = h; }, // /stop can cancel it
+  });
+  if (activeTask === handle) activeTask = null;
+  let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
+  if (code !== 0 || !envelope || envelope.is_error || envelope.local_command !== 'compact') {
+    log(`compact failed (exit=${code}): ${String(out).slice(0, 300)}`);
+    return '⚠️ Compaction did not run. The conversation is unchanged; /refresh starts fresh with a summary instead.';
+  }
+  state.lastActivity = new Date().toISOString();
+  saveState();
+  const after = sessionContextTokens(sessionId);
+  const k = (n) => `${Math.round(n / 1000)}k`;
+  log(`compacted session ${sessionId}: ${before} -> ${after} tokens`);
+  return `🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.`;
+}
+
 function maybeRotate({ notify = true } = {}) {
   const last = state.usage && state.usage.last;
   if (!last || last.source !== 'telegram' || !state.sessionId) return false;
@@ -1532,7 +1562,7 @@ async function telegramCommand(rawText) {
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
         + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
-        + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
+        + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
         + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
@@ -1577,6 +1607,7 @@ async function telegramCommand(rawText) {
           : `No installed skills found.${menu}`;
       },
       stop: (argument) => stopCommand(argument),
+      compact: () => compactConversation(),
       refresh: () => {
         if (!state.sessionId) return 'Already fresh: the next message starts a new conversation.';
         const ctx = sessionContextTokens(state.sessionId);
@@ -2169,7 +2200,8 @@ function previousStop() {
 }
 
 // Context size of a session = the prompt its last turn sent (fresh + cached
-// input), read from the tail of Claude's transcript.
+// input), read from the tail of Claude's transcript. A compaction after that
+// turn wins: its boundary records the size the summary left behind.
 function sessionContextTokens(sessionId) {
   try {
     const file = path.join(PROJECT_DIR, `${sessionId}.jsonl`);
@@ -2182,6 +2214,7 @@ function sessionContextTokens(sessionId) {
     const lines = buf.toString('utf-8').split('\n').reverse();
     for (const line of lines) {
       let ev; try { ev = JSON.parse(line); } catch (_) { continue; }
+      if (ev.subtype === 'compact_boundary' && ev.compactMetadata && ev.compactMetadata.postTokens != null) return ev.compactMetadata.postTokens;
       const u = ev.type === 'assistant' && ev.message && ev.message.usage;
       if (u) return (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
     }
