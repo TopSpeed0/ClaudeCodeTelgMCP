@@ -316,11 +316,13 @@ const CONFETTI_AFTER_MS = 2 * 60 * 1000;
 // Returns true when everything was delivered. If Telegram stays unreachable
 // after the client's retries, the undelivered rest goes to the outbox (or to
 // onUnsent, when the outbox itself is resending) and false is returned.
-async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent } = {}) {
+// buttons: extra inline-keyboard rows for the last chunk, under any Copy buttons.
+async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, buttons } = {}) {
   // Telegram caps messages at 4096 chars. We leave headroom for the <pre>...</pre> wrapper.
   const MAX = 3800;
   let remaining = stripAnsi(text || '(no output)');
-  const copyMarkup = mode === 'rich' ? copyKeyboard(codeBlocks(remaining)) : undefined;
+  let copyMarkup = mode === 'rich' ? copyKeyboard(codeBlocks(remaining)) : undefined;
+  if (buttons && buttons.length) copyMarkup = { inline_keyboard: [...((copyMarkup && copyMarkup.inline_keyboard) || []), ...buttons] };
   let effectId = effect;
   const threadUnder = replyTo;
   let attachFull = null;
@@ -780,8 +782,51 @@ function startFreshConversation(reason) {
   closeWarm(reason);
   state.sessionId = null;
   state.lastActivity = null;
+  state.planNonce = null; // a plan is only executable in the conversation that made it
   saveState();
 }
+
+// Closes the warm Claude and waits (up to 6 s) until it has let go of the session.
+async function releaseWarm(reason) {
+  const w = warm;
+  closeWarm(reason);
+  if (w && w.proc.exitCode == null) await Promise.race([new Promise(r => w.proc.once('exit', r)), new Promise(r => setTimeout(r, 6000))]);
+}
+
+// ---------- Memory flush ----------
+// Before the conversation shrinks (/compact) or is left behind (/refresh,
+// rotation), one silent turn on it asks Claude to save what is worth keeping to
+// its persistent memory, so details a summary would drop survive. Returns
+// Claude's one-line note, or null. Small conversations are skipped;
+// telegram.memory_flush: false turns it off.
+const MEMORY_FLUSH = TELEGRAM_RUNTIME.memory_flush !== false;
+const MEMORY_FLUSH_MIN_TOKENS = 20000;
+async function flushMemory(reason) {
+  const sessionId = state.sessionId;
+  if (!MEMORY_FLUSH || !sessionId) return null;
+  const ctx = sessionContextTokens(sessionId);
+  if (ctx != null && ctx < MEMORY_FLUSH_MIN_TOKENS) return null;
+  await releaseWarm(`memory flush before ${reason}`);
+  const prompt = `[Daemon maintenance, not a message from the user: this conversation is about to be ${reason}. `
+    + 'Before that, save anything from it worth keeping beyond this conversation (decisions, facts about systems, open items, preferences the user stated) '
+    + 'to your persistent memory, following your memory instructions. Skip what is already saved or only matters to this conversation. '
+    + 'Do not message the user and do not use Telegram tools. Reply with one short line: what you saved, or "nothing new".]';
+  let handle = null, code, out;
+  try {
+    ({ code, out } = await claudeRaw(prompt, ['--resume', sessionId], {
+      nativeMcp: false, onSpawn: (h) => { handle = h; activeTask = h; }, // /stop can cancel it
+    }));
+  } finally {
+    if (activeTask === handle) activeTask = null;
+  }
+  let envelope = null; try { envelope = JSON.parse(String(out).trim()); } catch (_) {}
+  if (code !== 0 || !envelope || envelope.is_error) { log(`memory flush failed (exit=${code}): ${String(out).slice(0, 300)}`); return null; }
+  recordUsage(envelope, CLAUDE_RUNTIME.model, 'memory');
+  const line = String(envelope.result || '').replace(TG_SENT_SENTINEL, '').trim().split('\n')[0].trim();
+  log(`memory flush before ${reason}: ${line || '(no reply)'}`);
+  return line || null;
+}
+const notesLine = (saved) => (saved ? `\n🧠 Notes: <i>${htmlEscape(shorten(saved, 200))}</i>` : '');
 
 // /compact: Claude Code's own compaction of the pinned session, run headless
 // ("claude -p /compact --resume <id>"). Unlike /refresh it keeps what Claude
@@ -806,9 +851,8 @@ async function compactConversation() {
     try { await tgApi('editMessageText', { chat_id: config.chat_id, message_id: note.message_id, parse_mode: 'HTML', text }); return null; }
     catch (e) { log(`compact note: ${e.message}`); return text; }
   };
-  const w = warm;
-  closeWarm('/compact');
-  if (w && w.proc.exitCode == null) await Promise.race([new Promise(r => w.proc.once('exit', r)), new Promise(r => setTimeout(r, 6000))]);
+  const saved = await flushMemory('compacted').catch((e) => { log(`memory flush: ${e.message}`); return null; });
+  await releaseWarm('/compact');
   let handle = null;
   let code, out;
   try {
@@ -822,25 +866,27 @@ async function compactConversation() {
   let envelope = null; try { envelope = JSON.parse(out.trim()); } catch (_) {}
   if (code !== 0 || !envelope || envelope.is_error || envelope.local_command !== 'compact') {
     log(`compact failed (exit=${code}): ${String(out).slice(0, 300)}`);
-    return finish('⚠️ Compaction did not run. The conversation is unchanged; /refresh starts fresh with a summary instead.');
+    return finish(`⚠️ Compaction did not run. The conversation is unchanged; /refresh starts fresh with a summary instead.${notesLine(saved)}`);
   }
   state.lastActivity = new Date().toISOString();
   saveState();
   const after = sessionContextTokens(sessionId);
   log(`compacted session ${sessionId}: ${before} -> ${after} tokens`);
   return finish(`🗜 <b>Compacted</b>${before != null && after != null ? `: ${k(before)} → ${k(after)} tokens` : ''}. Same conversation, now carried by Claude's own summary.\n`
-    + `Session: ${sessionLine()}`);
+    + `Session: ${sessionLine()}${notesLine(saved)}`);
 }
 
-function maybeRotate({ notify = true } = {}) {
+// notify: false (the check at startup) also skips the memory flush.
+async function maybeRotate({ notify = true } = {}) {
   const last = state.usage && state.usage.last;
   if (!last || last.source !== 'telegram' || !state.sessionId) return false;
   const context = (Number(last.inputTokens) + Number(last.cachedTokens)) / Math.max(1, Number(last.turns) || 1);
   if (context < ROTATE_TOKENS) return false;
   log(`rotation: last context ~${Math.round(context / 1000)}k tokens ≥ ${Math.round(ROTATE_TOKENS / 1000)}k — fresh conversation next`);
+  const saved = notify ? await flushMemory('replaced by a fresh conversation (it grew too large)').catch((e) => { log(`memory flush: ${e.message}`); return null; }) : null;
   startFreshConversation('conversation rotated');
   if (notify) {
-    sendChunked(`♻️ <i>Next message starts a fresh conversation: this one reached about ${Math.round(context / 1000)}k tokens, which makes every reply slow. Recent history carries over as a summary.</i>`, { mode: 'html' })
+    sendChunked(`♻️ <i>Next message starts a fresh conversation: this one reached about ${Math.round(context / 1000)}k tokens, which makes every reply slow. Recent history carries over as a summary.</i>${notesLine(saved)}`, { mode: 'html' })
       .catch(e => log(`rotation note: ${e.message}`));
   }
   return true;
@@ -1459,8 +1505,10 @@ async function buildRestoreContext() {
   const parts = [];
   // /clear creates a hard context boundary without deleting the audit archive.
   const cutoff = state.contextResetAt ? Date.parse(state.contextResetAt) : null;
-  const all = cutoff ? {} : loadDailySummaries();
-  const pastDates = Object.keys(all).sort().slice(-SUMMARY_DAYS);
+  // A day's summary covers the whole day, so only days after the clear's day count.
+  const cutoffDay = cutoff ? localDayKey(new Date(cutoff)) : null;
+  const all = loadDailySummaries();
+  const pastDates = Object.keys(all).filter(day => !cutoffDay || day > cutoffDay).sort().slice(-SUMMARY_DAYS);
   for (const day of pastDates) {
     parts.push(`[Summary of our previous conversation day (${day})]\n${all[day]}`);
   }
@@ -1580,7 +1628,7 @@ async function telegramCommand(rawText) {
     mcpNames: mcpNames(),
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
-        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
+        + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/doctor — health check of everything the bot depends on\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
         + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/compact — shrink this conversation with Claude\'s own summary\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
@@ -1589,6 +1637,7 @@ async function telegramCommand(rawText) {
       queue: () => formatQueue(),
       progress: (argument) => progressCommand(argument).text,
       usage: () => formatUsage(),
+      doctor: () => doctorReport(),
       status: () => {
         const readiness = mcp();
         return `<b>📊 Claude Bot Status</b>\n\n<b>Session</b>\nSession: <code>${htmlEscape(state.sessionId || 'Fresh')}</code>\n\n<b>Runtime</b>\nModel: <code>${htmlEscape(CLAUDE_RUNTIME.model)}</code>\nFallback: <code>${htmlEscape(CLAUDE_RUNTIME.fallback_model || 'none')}</code>\nMCP: <code>${readiness.summary}</code>\n\n<b>Features</b>\nProgress display: <code>${progressMode()}</code> (/progress)\nApproval gate: <code>${(RUNTIME.approval || {}).enabled === false ? 'OFF' : 'on'}</code>\nVoice: <code>${sttAvailable() ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'not installed'}</code>\n\n<b>Daemon</b>\nStatus: <code>Online</code>\nTask: <code>${busy ? 'running' : 'idle'}</code> · Queued: <code>${state.queue.length}</code> · Side tasks: <code>${bgTasks.size}</code>\nPID: <code>${process.pid}</code>\nUptime: <code>${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)}</code> (since ${tgTime(DAEMON_STARTED_AT.getTime(), 'wDT', DAEMON_STARTED_AT.toISOString())})\nBuild: <code>${daemonBuild()}</code>`;
@@ -1627,16 +1676,21 @@ async function telegramCommand(rawText) {
       },
       stop: (argument) => stopCommand(argument),
       compact: () => compactConversation(),
-      refresh: () => {
+      refresh: async () => {
         if (!state.sessionId) return 'Already fresh: the next message starts a new conversation.';
         const ctx = sessionContextTokens(state.sessionId);
+        const stopTyping = startTyping();
+        const saved = await flushMemory('replaced by a fresh conversation (/refresh)')
+          .catch((e) => { log(`memory flush: ${e.message}`); return null; })
+          .finally(stopTyping);
         startFreshConversation('/refresh');
-        return `♻️ <b>Refreshed</b>${ctx != null ? ` (the conversation was ${Math.round(ctx / 1000)}k tokens)` : ''}. Your next message starts a fresh conversation; the last ${RECENT_TURNS} turns and a summary of earlier ones carry over.\nSession: ${sessionLine()}`;
+        return `♻️ <b>Refreshed</b>${ctx != null ? ` (the conversation was ${Math.round(ctx / 1000)}k tokens)` : ''}. Your next message starts a fresh conversation; the last ${RECENT_TURNS} turns and a summary of earlier ones carry over.\nSession: ${sessionLine()}${notesLine(saved)}`;
       },
       clear: () => {
         closeWarm('/new');
         state.sessionId = null;
         state.lastActivity = null;
+        state.planNonce = null;
         state.contextResetAt = new Date().toISOString();
         saveState();
         return 'Claude session and injected context cleared. Archive files are retained, but pre-clear turns and summaries will not be injected into future tasks.';
@@ -1685,7 +1739,27 @@ function shorten(text, max = 60) {
 
 const PLAN_NOTE = '[Plan mode: this run is read-only. You cannot change anything, and tg_send is unavailable. '
   + 'Investigate as needed, then give your findings and a concrete step-by-step plan as your final message; '
-  + 'the daemon relays it. The user can reply "go ahead" to carry it out.]\n\n';
+  + 'the daemon relays it. The user can tap Execute or reply "go ahead" to carry it out.]\n\n';
+const PLAN_EXECUTE_TEXT = 'Go ahead: carry out the plan you proposed in your previous reply.';
+
+// A tap on a plan's ▶️ Execute / ❌ Dismiss. Only the latest plan can run, and
+// only while nothing else has run since (handleMessage clears state.planNonce).
+// Returns false when the button was not ours.
+function planButton(cq) {
+  const [tag, action, nonce] = String(cq.data || '').split(':');
+  if (tag !== 'px') return false;
+  if (!cq.message || String(cq.message.chat.id) !== String(config.chat_id)) return true;
+  const live = !!nonce && nonce === state.planNonce;
+  const answer = !live ? '⌛ This plan is out of date: something else ran since.' : action === 'run' ? '▶️ Running the plan' : 'Dismissed';
+  tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: answer }).catch(() => {});
+  tgApi('editMessageReplyMarkup', { chat_id: config.chat_id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }, { lowPriority: true })
+    .catch(e => log(`plan button: ${e.message}`));
+  if (!live) return true;
+  state.planNonce = null;
+  saveState();
+  if (action === 'run') enqueue({ text: PLAN_EXECUTE_TEXT, msgId: cq.message.message_id });
+  return true;
+}
 
 // A queue item is { text, msgId, media?, ts }. Commands are recognised from text.
 async function handleMessage(item) {
@@ -1738,6 +1812,7 @@ async function handleMessage(item) {
   if (item.context) rawText = `${item.context}\n\n${rawText}`;
   state.lastTask = rawText;
   state.lastTaskMode = permissionMode || null;
+  state.planNonce = null; // an earlier plan's Execute button no longer applies
   saveState();
   await rolloverIfNewDay();
   const stopTyping = startTyping();
@@ -1818,20 +1893,30 @@ async function runTask(rawText, msgId, t0, { permissionMode, status } = {}) {
   }
   appendArchive({ day: state.day, ts: new Date().toISOString(), user: permissionMode === 'plan' ? `/plan ${rawText}` : rawText, assistant: replyForArchive, sessionId: state.sessionId, forked: !!forked });
 
+  // A plan ends with ▶️ Execute / ❌ Dismiss buttons.
+  let buttons;
+  if (permissionMode === 'plan') {
+    state.planNonce = crypto.randomBytes(4).toString('hex');
+    saveState();
+    buttons = [[
+      { text: '▶️ Execute', callback_data: `px:run:${state.planNonce}`, style: 'success' },
+      { text: '❌ Dismiss', callback_data: `px:no:${state.planNonce}`, style: 'danger' },
+    ]];
+  }
+
   // Relay to the user. Every successful path ends with the 🎉 "done" reaction,
   // including the usual one where the agent already answered through tg_send.
-  if (TG_SENT_SENTINEL.test(trimmed)) {
-    log(`relay suppressed: agent used tg_send sentinel (${dt}s, stdout=${trimmed.length} chars)`);
-  } else if (!trimmed) {
-    log(`relay suppressed: empty stdout (${dt}s)`);
+  if (TG_SENT_SENTINEL.test(trimmed) || !trimmed) {
+    log(`relay suppressed: ${trimmed ? 'agent used tg_send sentinel' : 'empty stdout'} (${dt}s, stdout=${trimmed.length} chars)`);
+    if (buttons) await sendChunked('🧪 <b>Plan ready</b> (read-only, nothing was changed).', { mode: 'html', replyTo: msgId, buttons });
   } else {
     // Agent's stdout IS the answer — relay as rich HTML (Markdown -> Telegram HTML),
     // with the looksTabular() <pre> fallback inside sendChunked.
-    const header = permissionMode === 'plan' ? '🧪 **Plan (read-only, nothing was changed).** Reply *go ahead* to carry it out.\n\n' : '';
-    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
+    const header = permissionMode === 'plan' ? '🧪 **Plan (read-only, nothing was changed).** Tap *Execute* to carry it out, or reply with changes.\n\n' : '';
+    await sendChunked(header + trimmed, { mode: 'rich', replyTo: msgId, buttons, effect: Date.now() - t0 >= CONFETTI_AFTER_MS ? EFFECT_CONFETTI : undefined });
   }
   await tgReact(msgId, '🎉');
-  maybeRotate();
+  await maybeRotate();
 }
 
 // ---------- Restart recovery ----------
@@ -2126,7 +2211,7 @@ async function dispatchMessage(m, { fromAsker = false } = {}) {
 }
 
 async function pollLoop() {
-  log(`ready — workdir=${WORKDIR} chat_id=${config.chat_id} session_resumed=${state.sessionStarted}`);
+  log(`ready — workdir=${WORKDIR} chat_id=${config.chat_id} session=${state.sessionId || 'new'}`);
   drainQueue(); // messages queued before a restart
   while (true) {
     for (const m of handshake.takeDaemonInbox()) await dispatchMessage(m, { fromAsker: true });
@@ -2152,7 +2237,7 @@ async function pollLoop() {
       state.updateOffset = u.update_id + 1;
       saveState();
       if (u.message) await dispatchMessage(u.message);
-      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query)) await handleStaleButton(u.callback_query);
+      else if (u.callback_query && !progressButton(u.callback_query) && !voiceButton(u.callback_query) && !planButton(u.callback_query)) await handleStaleButton(u.callback_query);
     }
   }
 }
@@ -2324,6 +2409,75 @@ async function sendMotd(prevStop) {
   catch (e) { log(`motd: ${e.message}`); }
 }
 
+// ---------- /doctor ----------
+// One health check of everything the bridge leans on. Each line is ✅ fine,
+// ⚠️ worth a look, or ❌ broken; the header counts the problems.
+const AUTOSTART_TASK = 'Claude Telegram Task Bridge'; // the Windows scheduled task that runs the launcher
+function runQuiet(command, args, timeoutMs) {
+  return new Promise((resolve) => {
+    require('child_process').execFile(command, args, { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' },
+      (error, stdout) => resolve(error ? null : String(stdout).trim()));
+  });
+}
+
+async function doctorReport() {
+  const lines = [];
+  const add = (level, label, detail) => lines.push({ level, text: `${{ ok: '✅', warn: '⚠️', bad: '❌' }[level]} <b>${label}</b>: ${detail}` });
+  const [me, cli, plan, stt, autostart] = await Promise.all([
+    tgApi('getMe', {}).catch(() => null),
+    runQuiet(CLAUDE_EXECUTABLE, ['--version'], 20000),
+    planUsage(),
+    sttReady ? Promise.resolve('ready') : runQuiet(PYTHON, ['-c', 'import faster_whisper'], 60000).then(r => (r == null ? null : 'ready')),
+    process.platform === 'win32' ? runQuiet('schtasks', ['/Query', '/TN', AUTOSTART_TASK, '/FO', 'LIST'], 10000) : Promise.resolve(undefined),
+  ]);
+  if (stt) sttReady = true;
+
+  add(me ? 'ok' : 'bad', 'Telegram', me ? `@${htmlEscape(me.username)}` : 'getMe failed (token or network)');
+  add(cli ? 'ok' : 'bad', 'Claude CLI', cli ? `<code>${htmlEscape(cli.split('\n')[0])}</code>` : `no answer from <code>${htmlEscape(path.basename(CLAUDE_EXECUTABLE))} --version</code>`);
+  const systemCa = process.execArgv.includes('--use-system-ca');
+  add(systemCa ? 'ok' : 'warn', 'Node', `<code>${process.version}</code>${systemCa ? ' with system CA' : ', no --use-system-ca (HTTPS breaks behind the TLS proxy)'}`);
+  add('ok', 'Session', sessionLine());
+  if (plan) {
+    const worst = Math.max(Number((plan.five_hour || {}).utilization) || 0, Number((plan.seven_day || {}).utilization) || 0);
+    add(worst >= 80 ? 'warn' : 'ok', 'Limits', `${limitText('5h', plan.five_hour, 't')} | ${limitText('Week', plan.seven_day, 'wt')}`);
+  } else {
+    add('warn', 'Limits', 'usage not reachable');
+  }
+
+  if (!mcpCatalog.at) add('warn', 'MCP', 'discovery has not finished yet');
+  else {
+    const broken = mcpCatalog.servers.filter(server => server.error);
+    add(broken.length ? 'warn' : 'ok', 'MCP', `${mcpCatalog.servers.length - broken.length}/${mcpCatalog.servers.length} answering`
+      + (broken.length ? `; not answering: ${broken.map(server => `<code>${htmlEscape(server.name)}</code>`).join(', ')}` : ''));
+  }
+  const gateOn = (RUNTIME.approval || {}).enabled !== false;
+  const hookWired = fs.existsSync(DAEMON_SETTINGS);
+  add(gateOn && hookWired ? 'ok' : 'warn', 'Approvals', !gateOn ? 'gate is OFF (approval.enabled: false)' : hookWired ? 'gate on' : 'hook settings file missing');
+  add(stt ? 'ok' : 'warn', 'Voice', stt ? `ready (${htmlEscape(String(VOICE.model || 'small'))})` : 'faster-whisper not installed');
+
+  if (autostart !== undefined) {
+    const status = autostart && (autostart.match(/^Status:\s*(.+)$/m) || [])[1];
+    add(autostart ? 'ok' : 'warn', 'Autostart', autostart ? `scheduled task ${status ? `<code>${htmlEscape(status.trim())}</code>` : 'found'}` : `no scheduled task "${htmlEscape(AUTOSTART_TASK)}"`);
+  }
+  try {
+    const disk = fs.statfsSync(WORKDIR);
+    const freeGb = (disk.bavail * disk.bsize) / 1e9;
+    add(freeGb < 5 ? 'warn' : 'ok', 'Disk', `${freeGb.toFixed(1)} GB free`);
+  } catch (_) { /* statfs needs Node 18.15+ */ }
+  let lockPid = null; try { lockPid = fs.readFileSync(LOCK_FILE, 'utf-8').trim(); } catch (_) {}
+  add(lockPid === String(process.pid) ? 'ok' : 'warn', 'Lock', lockPid === String(process.pid) ? `held by this daemon (PID ${process.pid})` : `lock file says PID ${htmlEscape(String(lockPid))}, this daemon is ${process.pid}`);
+  const outbox = (state.outbox || []).length;
+  add(outbox ? 'warn' : 'ok', 'Delivery', `queue ${state.queue.length} · side tasks ${bgTasks.size}${outbox ? ` · ${outbox} answer(s) waiting to be resent` : ' · nothing undelivered'}`);
+  const summaries = Object.keys(loadDailySummaries()).sort();
+  add('ok', 'Archive', `${readDayTurns(state.day || localDayKey()).length} turns today · ${summaries.length} daily summaries${summaries.length ? ` (latest ${summaries[summaries.length - 1]})` : ''}`);
+  add('ok', 'Daemon', `up ${formatUptime((Date.now() - DAEMON_STARTED_AT.getTime()) / 1000)} · build <code>${daemonBuild()}</code>`);
+
+  const bad = lines.filter(line => line.level === 'bad').length;
+  const warn = lines.filter(line => line.level === 'warn').length;
+  const verdict = bad ? `${bad} broken, ${warn} to check` : warn ? `${warn} to check` : 'all good';
+  return `🩺 <b>Doctor</b>: ${verdict}\n\n${lines.map(line => line.text).join('\n')}`;
+}
+
 // ---------- Hermes queue poller ----------
 const HERMES_QUEUE = path.join(WORKDIR, '.claude-queue.json');
 
@@ -2387,7 +2541,7 @@ registerTelegramCommandMenu()
 setPresence(true);
 setInterval(() => setPresence(true), PRESENCE_EVERY_MS);
 setInterval(() => flushOutbox().catch(e => log(`outbox: ${e.message}`)), OUTBOX_RETRY_MS);
-maybeRotate({ notify: false });
+maybeRotate({ notify: false }).catch(e => log(`rotation: ${e.message}`));
 sendMotd(prevStop)
   .then(() => recoverInterrupted())
   .catch(e => log(`recovery: ${e.message}`))
