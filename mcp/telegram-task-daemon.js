@@ -774,16 +774,22 @@ function warmTurn(prompt, { sessionId, resuming, model, onEvent, onSpawn, replyT
 // archive carry over (buildRestoreContext).
 const ROTATE_TOKENS = Number(TELEGRAM_RUNTIME.rotate_tokens) || 150000;
 
+// Unpin the session; the next task restores context from the archive
+// (buildRestoreContext) instead of resuming. Also used by /refresh.
+function startFreshConversation(reason) {
+  closeWarm(reason);
+  state.sessionId = null;
+  state.lastActivity = null;
+  saveState();
+}
+
 function maybeRotate({ notify = true } = {}) {
   const last = state.usage && state.usage.last;
   if (!last || last.source !== 'telegram' || !state.sessionId) return false;
   const context = (Number(last.inputTokens) + Number(last.cachedTokens)) / Math.max(1, Number(last.turns) || 1);
   if (context < ROTATE_TOKENS) return false;
   log(`rotation: last context ~${Math.round(context / 1000)}k tokens ≥ ${Math.round(ROTATE_TOKENS / 1000)}k — fresh conversation next`);
-  closeWarm('conversation rotated');
-  state.sessionId = null;
-  state.lastActivity = null;
-  saveState();
+  startFreshConversation('conversation rotated');
   if (notify) {
     sendChunked(`♻️ <i>Next message starts a fresh conversation: this one reached about ${Math.round(context / 1000)}k tokens, which makes every reply slow. Recent history carries over as a summary.</i>`, { mode: 'html' })
       .catch(e => log(`rotation note: ${e.message}`));
@@ -1526,7 +1532,7 @@ async function telegramCommand(rawText) {
     handlers: {
       help: () => '<b>📋 Claude Bot Commands</b>\n\n'
         + '<b>Control</b> <i>(answered at once, even mid-task)</i>\n/status — daemon and runtime\n/stop — stop the running task · <code>/stop all</code> also the queue and side tasks · <code>/stop bg</code> side tasks only\n/queue — running task, side tasks and waiting messages\n/usage — cost, turns and time: last task and today\n/progress — how much live progress you see (off · quiet · normal · full)\n/bg &lt;task&gt; — side task in its own session, in parallel\n\n'
-        + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
+        + '<b>Conversation</b> <i>(run in turn)</i>\n/plan &lt;task&gt; — read-only run: looks and proposes, changes nothing\n/retry — run your last message again\n/refresh — fresh conversation that keeps a summary of this one\n/new or /clear — fresh session and conversation context\n/model [name] — current model or switch allowed model\n\n'
         + '<b>Info</b>\n/mcp — configured MCP connectors\n/skills — installed skills\n/help — this list\n\n'
         + '📸 Photos and files are passed to Claude to read. 🎙 Voice notes are transcribed when speech-to-text is installed.\n'
         + '🛡 Risky actions (sending mail, cluster writes, deletes, pushes) wait for your ✅ / ❌.\n'
@@ -1571,6 +1577,12 @@ async function telegramCommand(rawText) {
           : `No installed skills found.${menu}`;
       },
       stop: (argument) => stopCommand(argument),
+      refresh: () => {
+        if (!state.sessionId) return 'Already fresh: the next message starts a new conversation.';
+        const ctx = sessionContextTokens(state.sessionId);
+        startFreshConversation('/refresh');
+        return `♻️ <b>Refreshed</b>${ctx != null ? ` (the conversation was ${Math.round(ctx / 1000)}k tokens)` : ''}. Your next message starts a fresh conversation; the last ${RECENT_TURNS} turns and a summary of earlier ones carry over.`;
+      },
       clear: () => {
         closeWarm('/new');
         state.sessionId = null;

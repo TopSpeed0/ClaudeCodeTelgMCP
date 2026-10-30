@@ -23,6 +23,8 @@
   },
   "telegram": {
     "progress": true,
+    "rotate_tokens": 150000,
+    "motd": true,
     "voice": { "model": "small", "language": "" }
   },
   "approval": {
