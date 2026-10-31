@@ -23,6 +23,7 @@
   },
   "telegram": {
     "progress": true,
+    "rich_table_max_columns": 4,
     "rotate_tokens": 150000,
     "motd": true,
     "voice": { "model": "small", "language": "" },

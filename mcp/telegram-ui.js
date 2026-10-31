@@ -52,51 +52,83 @@ function htmlPage(telegramHtml) {
     + `<div style="white-space:pre-wrap">${telegramHtml}</div></body>`;
 }
 
-// Markdown tables, which Telegram cannot show: each one in `markdown` is
-// replaced by a placeholder from `mark(i)` and returned as finished Telegram
-// HTML. A table that fits a phone (PHONE_COLUMNS wide) becomes an aligned
-// monospace block; a wider one becomes one line per row, the first cell in
-// bold, so a narrow screen never shows raw pipes or wrapped columns.
-const PHONE_COLUMNS = 36;
+// Markdown tables in Telegram HTML, which has no tables: each one in
+// `markdown` is replaced by a placeholder from `mark(i)` and returned as
+// finished HTML. A table up to MONO_MAX_WIDTH characters wide becomes an
+// aligned monospace block (with Telegram's Copy header); a wider one becomes
+// one line per row, the first cell in bold, so it never shows raw pipes or
+// wrapped columns. (In a rich message narrow tables stay native: richTables.)
+const MONO_MAX_WIDTH = 60;
 const TABLE_RULE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
 const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Characters on screen: an emoji takes two cells of a monospace line, its
+// variation selector none, so 🔴 columns stay aligned.
+const displayWidth = (s) => [...s].reduce((w, ch) => w + (/\p{Extended_Pictographic}/u.test(ch) ? 2 : /[️‍]/.test(ch) ? 0 : 1), 0);
 
 function tableCells(line) {
   return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|')
     .map(cell => cell.trim().replace(/\*\*|__|`/g, ''));
 }
 
-function renderTable(rows) {
+// The table as aligned monospace lines (header, rule, rows), or null when it
+// is wider than MONO_MAX_WIDTH.
+function alignedTable(rows) {
   const columns = Math.max(...rows.map(r => r.length));
   const grid = rows.map(r => Array.from({ length: columns }, (_, i) => r[i] || ''));
-  const widths = Array.from({ length: columns }, (_, i) => Math.max(...grid.map(r => [...r[i]].length)));
+  const widths = Array.from({ length: columns }, (_, i) => Math.max(...grid.map(r => displayWidth(r[i]))));
   const total = widths.reduce((a, b) => a + b, 0) + 2 * (columns - 1);
-  if (total <= PHONE_COLUMNS) {
-    const line = (r) => r.map((cell, i) => cell + ' '.repeat(widths[i] - [...cell].length)).join('  ').trimEnd();
-    const [head, ...body] = grid;
-    return `<pre>${escapeHtml([line(head), '─'.repeat(total), ...body.map(line)].join('\n'))}</pre>`;
-  }
-  // Wide: one line per data row; the header is dropped, the cells speak for themselves.
-  return grid.slice(1).map(r => r.filter(Boolean))
+  if (total > MONO_MAX_WIDTH) return null;
+  const line = (r) => r.map((cell, i) => cell + ' '.repeat(widths[i] - displayWidth(cell))).join('  ').trimEnd();
+  const [head, ...body] = grid;
+  return [line(head), '─'.repeat(total), ...body.map(line)].join('\n');
+}
+
+// Too wide even for that: one line per data row; the header is dropped, the cells speak for themselves.
+const rowLines = (rows) => rows.slice(1).map(r => r.filter(Boolean));
+
+function renderTable(rows) {
+  const aligned = alignedTable(rows);
+  if (aligned) return `<pre>${escapeHtml(aligned)}</pre>`;
+  return rowLines(rows)
     .map(r => `• <b>${escapeHtml(r[0] || '')}</b>${r.length > 1 ? ` · ${r.slice(1).map(escapeHtml).join(' · ')}` : ''}`).join('\n');
 }
 
-function extractTables(markdown, mark) {
+// Calls replace(rows, sourceLines) for each Markdown table and puts its result in place.
+function eachTable(markdown, replace) {
   const lines = String(markdown).split('\n');
-  const out = [], tables = [];
+  const out = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].includes('|') && i + 1 < lines.length && TABLE_RULE.test(lines[i + 1]) && lines[i + 1].includes('-')) {
       const rows = [tableCells(lines[i])];
       let j = i + 2;
       for (; j < lines.length && lines[j].includes('|') && lines[j].trim(); j++) rows.push(tableCells(lines[j]));
-      out.push(mark(tables.length));
-      tables.push(renderTable(rows));
+      out.push(replace(rows, lines.slice(i, j)));
       i = j - 1;
     } else {
       out.push(lines[i]);
     }
   }
-  return { text: out.join('\n'), tables };
+  return out.join('\n');
+}
+
+function extractTables(markdown, mark) {
+  const tables = [];
+  const text = eachTable(markdown, (rows) => { tables.push(renderTable(rows)); return mark(tables.length - 1); });
+  return { text, tables };
+}
+
+// For a rich message, where Telegram draws Markdown tables itself: a table
+// with up to maxColumns columns stays one (text reads well wrapped in cells);
+// a wider one, usually data, becomes an aligned code block, or one line per
+// row when too wide even for that.
+function richTables(markdown, maxColumns) {
+  return eachTable(markdown, (rows, source) => {
+    if (Math.max(...rows.map(r => r.length)) <= maxColumns) return source.join('\n');
+    const aligned = alignedTable(rows);
+    if (aligned) return `\`\`\`\n${aligned}\n\`\`\``;
+    return rowLines(rows).map(r => `- **${r[0] || ''}**${r.length > 1 ? ` · ${r.slice(1).join(' · ')}` : ''}`).join('\n');
+  });
 }
 
 // Markdown for a rich message (sendRichMessage): there a lone newline joins
@@ -120,4 +152,4 @@ function richMarkdown(text) {
   return out + breaks(src.slice(pos));
 }
 
-module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, PHONE_COLUMNS, richMarkdown, RICH_LIMIT };
+module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, richTables, MONO_MAX_WIDTH, richMarkdown, RICH_LIMIT };

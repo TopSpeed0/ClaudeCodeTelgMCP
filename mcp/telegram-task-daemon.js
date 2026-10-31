@@ -30,7 +30,7 @@ const { maskSecrets } = require('./secret-mask');
 const { noteMessage, sessionOfMessage } = require('./message-sessions');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
-const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
+const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
@@ -230,7 +230,15 @@ function recoverReplyFromTranscript(sessionId) {
 // Shared client (telegram-client.js): timeouts, retries, 429 handling, and
 // one-at-a-time sends per chat.
 const telegram = createTelegramClient({ token: config.bot_token, log });
-function tgApi(method, params, options) { return telegram.call(method, params, options); }
+// When the bot last put a real message in the chat: a live draft must not be
+// refreshed after that, or it shows up again under the answer (see startDraft).
+let botSpokeAt = 0;
+const SPEAKS = /^(sendMessage|sendRichMessage|sendDocument|sendPhoto|sendVoice|sendAudio|sendVideo|sendMediaGroup)$/;
+function tgApi(method, params, options) {
+  const call = telegram.call(method, params, options);
+  if (SPEAKS.test(method)) call.then(() => { botSpokeAt = Date.now(); }, () => {});
+  return call;
+}
 
 function stripAnsi(s) {
   // Drop ANSI CSI sequences (colors, cursor moves) that `claude -p` can emit.
@@ -245,8 +253,8 @@ function htmlEscape(s) {
 // when the agent forgets to use tg_send, its plain stdout still renders as
 // rich formatting instead of an ugly <pre> monospace block.
 //
-// Supported: fenced code, inline code, bold, italic, headers, bullets, numbered lists, tables.
-// Out of scope: links, images, Markdown blockquotes.
+// Supported: fenced code, inline code, bold, italic, headers, bullets, numbered
+// lists, tables, [links](https://…) and "> " quotes. Out of scope: images.
 const TELEGRAM_TAG = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|tg-spoiler|blockquote)>|<blockquote expandable>|<a href="[^"<>]*">|<\/a>|<tg-time\b[^<>]*>|<\/tg-time>/gi;
 function markdownToTelegramHTML(text) {
   // Stash fenced code blocks first so their contents are immune to subsequent
@@ -296,6 +304,15 @@ function markdownToTelegramHTML(text) {
   // Bullet lists: `- item` / `* item` -> `• item`.
   html = html.replace(/^[ \t]*[-*] +(.+)$/gm, '• $1');
 
+  // Links: [text](https://…). The URL was escaped above, which is what href needs.
+  html = html.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)"]+)\)/g, '<a href="$2">$1</a>');
+
+  // Quotes: consecutive "> " lines become one blockquote, tap-to-expand past 4 lines.
+  html = html.replace(/^&gt; ?.*(?:\n&gt; ?.*)*/gm, (block) => {
+    const lines = block.split('\n').map(line => line.replace(/^&gt; ?/, ''));
+    return `<blockquote${lines.length > 4 ? ' expandable' : ''}>${lines.join('\n')}</blockquote>`;
+  });
+
   // Numbered lists: keep `1. item` as plain text (already readable).
   // No transformation needed; HTML escape was already applied.
 
@@ -337,7 +354,10 @@ function looksTabular(text) {
 const EFFECT_CONFETTI = MESSAGE_EFFECTS.confetti;
 const CONFETTI_AFTER_MS = 2 * 60 * 1000;
 // Answers with a Markdown table are sent as rich messages (real tables); off with telegram.rich_tables: false.
+// Only narrow tables, though: one with more columns than this (data such as a
+// volume list) reads better as an aligned monospace block (telegram.rich_table_max_columns).
 const RICH_TABLES = TELEGRAM_RUNTIME.rich_tables !== false;
+const RICH_TABLE_MAX_COLUMNS = Number(TELEGRAM_RUNTIME.rich_table_max_columns) || 4;
 const hasTelegramTags = (text) => { TELEGRAM_TAG.lastIndex = 0; const found = TELEGRAM_TAG.test(text); TELEGRAM_TAG.lastIndex = 0; return found; };
 
 // effect: a message effect id played on the first chunk. Short fenced code
@@ -359,14 +379,16 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
 
   // An answer with a Markdown table goes out whole as a rich message
   // (sendRichMessage): Telegram draws real tables, headings and lists from the
-  // Markdown itself. Text with Telegram HTML tags in it, text over the rich
-  // limit, or a refusal takes the usual HTML path below instead.
+  // Markdown itself, and tables wider than RICH_TABLE_MAX_COLUMNS become
+  // aligned code blocks in it (richTables). Text with Telegram HTML tags in
+  // it, text over the rich limit, or a refusal takes the usual HTML path
+  // below instead, where every table is a monospace block.
   if (mode === 'rich' && RICH_TABLES && remaining.length <= RICH_LIMIT && !hasTelegramTags(remaining)
       && extractTables(remaining, () => '').tables.length) {
     try {
       const sent = await tgApi('sendRichMessage', {
         chat_id: config.chat_id,
-        rich_message: { markdown: richMarkdown(remaining) },
+        rich_message: { markdown: richMarkdown(richTables(remaining, RICH_TABLE_MAX_COLUMNS)) },
         link_preview_options: { is_disabled: true },
         reply_parameters: replyTo != null ? { message_id: replyTo, allow_sending_without_reply: true } : undefined,
         reply_markup: copyMarkup,
@@ -388,9 +410,11 @@ async function sendChunked(text, { mode = 'rich', replyTo, effect, onUnsent, but
   }
 
   // In 'rich' mode, fall back to monospace if the payload looks like a table —
-  // alignment matters more than formatting for CLI output.
+  // alignment matters more than formatting for CLI output. Fenced code and
+  // Markdown table rows are already laid out, so only the prose is checked.
   let effectiveMode = mode;
-  if (mode === 'rich' && looksTabular(remaining)) effectiveMode = 'mono';
+  const prose = remaining.replace(/```[\s\S]*?```/g, '').replace(/^\s*\|.*$/gm, '');
+  if (mode === 'rich' && looksTabular(prose)) effectiveMode = 'mono';
 
   while (remaining.length > 0) {
     let chunk = remaining.slice(0, MAX);
@@ -1082,7 +1106,9 @@ function tgSendFile(filePath, caption, replyTo) {
   const fields = { chat_id: config.chat_id };
   if (caption) fields.caption = caption;
   if (replyTo != null) fields.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
-  return telegram.multipart(method, fields, field, filePath);
+  const call = telegram.multipart(method, fields, field, filePath);
+  call.then(() => { botSpokeAt = Date.now(); }, () => {});
+  return call;
 }
 
 // ---------- Live status message ----------
@@ -1297,17 +1323,26 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
   const mode = PROGRESS_MODES[progressMode()];
   const steps = [];
   let count = 0, text = '', stopped = false, failed = false, lastAt = 0, timer = null, updates = 0, streamed = 0;
+  // A real message from the bot replaces the draft, and the API has no way to
+  // clear one: a refresh after it would bring the bubble back under the
+  // answer, where nothing removes it. So once the bot has spoken (or Claude
+  // calls tg_send / tg_ask) the draft stays quiet until new work shows.
+  let activityAt = t0;
+  const quiet = () => botSpokeAt >= activityAt;
+  // "[sent-via-tg]" (or the start of it) is Claude's note to the daemon, not text for the bubble.
+  const sentinelOnly = (t) => { const s = t.trim().toLowerCase(); return !s || '[sent-via-tg]'.startsWith(s) || !s.replace(TG_SENT_SENTINEL, '').trim(); };
   const render = () => {
     const secs = Math.floor((Date.now() - t0) / 1000);
-    const writing = text.trim() !== '';
+    const shown = sentinelOnly(text) ? '' : text.replace(TG_SENT_SENTINEL, '');
+    const writing = shown.trim() !== '';
     const head = `${writing ? '✍️' : '⏳'} <b>${htmlEscape(writing ? 'Writing' : title)}</b> · ${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}`
       + `${count ? ` · ${count} step${count === 1 ? '' : 's'}` : ''}`;
-    const body = previewText(text.length > DRAFT_MAX_TEXT ? `…${text.slice(-DRAFT_MAX_TEXT)}` : text).trim();
+    const body = previewText(shown.length > DRAFT_MAX_TEXT ? `…${shown.slice(-DRAFT_MAX_TEXT)}` : shown).trim();
     return [head, ...(mode.steps ? steps.slice(-mode.steps) : []), body ? `\n${htmlEscape(body)} ▍` : ''].filter(Boolean).join('\n');
   };
   const send = async () => {
     timer = null;
-    if (stopped || failed) return;
+    if (stopped || failed || quiet()) return;
     lastAt = Date.now();
     try {
       await tgApi('sendMessageDraft', { chat_id: config.chat_id, draft_id: draftId, text: render(), parse_mode: 'HTML', can_stop: true }, { lowPriority: true });
@@ -1333,13 +1368,20 @@ function startDraft(replyTo, { title = 'Working', workingReaction, onStop } = {}
         // Each new text block is what Claude is saying now; earlier
         // narration between tool calls is replaced.
         if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'text') text = '';
-        if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') { text += e.delta.text || ''; streamed += (e.delta.text || '').length; schedule(); }
+        if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'text_delta') {
+          text += e.delta.text || '';
+          streamed += (e.delta.text || '').length;
+          if (!sentinelOnly(text)) { activityAt = Date.now(); schedule(); }
+        }
         return;
       }
       if (ev.type !== 'assistant' || !ev.message || !Array.isArray(ev.message.content)) return;
       let added = false;
       for (const c of ev.message.content) {
         if (!c || c.type !== 'tool_use') continue;
+        // The answer (or a question) goes out as a real message now.
+        if (/^mcp__telegram-tg__tg_(send|ask)$/.test(String(c.name))) { botSpokeAt = Date.now(); continue; }
+        activityAt = Date.now();
         const line = toolLine(String(c.name || ''), c.input);
         if (!line) continue;
         if (count === 0 && workingReaction) tgReact(replyTo, workingReaction);
