@@ -1,7 +1,7 @@
 # Claude Code Workspace — Telegram Bridge
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node.js 18+](https://img.shields.io/badge/Node.js-18%2B-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js 22.15+](https://img.shields.io/badge/Node.js-22.15%2B-339933.svg?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-MCP%20Server-7C3AED.svg?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
@@ -33,7 +33,7 @@ Install all three in any order — one line each:
 
 | Tool | Windows | macOS / Linux (untested) |
 |------|---------|---------------|
-| **Node.js 22+** | `winget install OpenJS.NodeJS.LTS` | `curl -fsSL https://fnm.vercel.app/install \| bash && fnm install --lts` |
+| **Node.js 22.15+** | `winget install OpenJS.NodeJS.LTS` | `curl -fsSL https://fnm.vercel.app/install \| bash && fnm install --lts` |
 | **PowerShell 7+** | `winget install Microsoft.PowerShell` | `brew install powershell` / [install docs](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-linux) |
 | **Claude Code** | `npm install -g @anthropic-ai/claude-code` | `npm install -g @anthropic-ai/claude-code` |
 
@@ -183,7 +183,7 @@ When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-
 
 - **Add your own tools**: Edit `CLAUDE.md` with domain-specific instructions
 - **Add a workspace profile**: Create `profile1.ps1` with custom PowerShell functions, reference it in `CLAUDE.md`
-- **Corporate proxy/TLS**: Add `--use-system-ca` to Node args in `.mcp.json` (requires Node 22+)
+- **Corporate proxy/TLS**: Add `--use-system-ca` to Node args in `.mcp.json` (requires Node 22.15+)
 - **Other platforms**: Tested on Windows only. The daemon has macOS/Linux code paths (process spawning, paths) but they are untested
 
 ## Requirements

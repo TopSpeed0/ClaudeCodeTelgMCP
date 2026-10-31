@@ -77,7 +77,7 @@ If your organization intercepts TLS (MITM proxy), Node.js will fail HTTPS calls 
 }
 ```
 
-This requires Node.js 22+. PowerShell/curl already use the OS cert store and are unaffected.
+This requires Node.js 22.15+. PowerShell/curl already use the OS cert store and are unaffected.
 
 ---
 
