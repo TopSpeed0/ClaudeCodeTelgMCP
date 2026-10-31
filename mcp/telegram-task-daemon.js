@@ -37,6 +37,10 @@ const WORKDIR = path.resolve(__dirname, '..');
 const STATE_FILE = path.join(WORKDIR, '.telegram-task-state.json');
 const LOCK_FILE = path.join(WORKDIR, '.telegram-task-daemon.lock');
 const EMPTY_MCP = path.join(__dirname, 'daemon-mcp.local.json');
+// Tells every spawned session it runs under the daemon, so it follows the
+// daemon rules in CLAUDE.md (an interactive session never gets this line).
+const DAEMON_NOTE = 'You are running under the Telegram task daemon: the user reads your replies in Telegram. '
+  + 'Follow the "Telegram Behavioral Rules" in CLAUDE.md for daemon sessions.';
 
 // ---------- Conversation archive / memory ----------
 // Continuity lives in OUR files, not Claude's fragile session resume. Every turn
@@ -620,7 +624,8 @@ function claudeRaw(task, extraArgs, { model = CLAUDE_RUNTIME.model, onSpawn, rep
                   '--model', String(model),
                   '--output-format', onEvent ? 'stream-json' : 'json',
                   '--mcp-config', EMPTY_MCP,
-                  '--settings', DAEMON_SETTINGS];
+                  '--settings', DAEMON_SETTINGS,
+                  '--append-system-prompt', DAEMON_NOTE];
     if (!nativeMcp) args.push('--strict-mcp-config');
     if (onEvent) args.push('--verbose'); // stream-json in print mode requires it
     if (onEvent && STREAM) args.push('--include-partial-messages'); // text as it is written, for the live draft
@@ -748,7 +753,7 @@ let warm = null; // { proc, sessionId, model, buf, turn, lastCost, errOut, used,
 
 function startWarm(sessionId, resuming, model) {
   const args = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose', ...(STREAM ? ['--include-partial-messages'] : []),
-    '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--dangerously-skip-permissions'];
+    '--model', String(model), '--mcp-config', EMPTY_MCP, '--settings', DAEMON_SETTINGS, '--append-system-prompt', DAEMON_NOTE, '--dangerously-skip-permissions'];
   if (CLAUDE_RUNTIME.fallback_model) args.push('--fallback-model', String(CLAUDE_RUNTIME.fallback_model));
   if (CLAUDE_RUNTIME.reasoning_effort) args.push('--effort', String(CLAUDE_RUNTIME.reasoning_effort));
   if (CLAUDE_RUNTIME.chrome === true) args.push('--chrome');

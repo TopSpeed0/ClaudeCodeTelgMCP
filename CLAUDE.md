@@ -13,23 +13,26 @@ This repo ships **only** the Telegram bridge — it is intentionally lean. Domai
 ## Components
 
 ### MCP Server — `mcp/telegram-tg.js`
-Zero-dependency Node.js MCP server (stdio, JSON-RPC 2.0) exposing two tools:
-- **`tg_send`** — one-way notification (fire-and-forget)
+Zero-dependency Node.js MCP server (stdio, JSON-RPC 2.0) exposing five tools:
+- **`tg_send`** — one-way message, optionally with a file, an `effect` or `copy` buttons
 - **`tg_ask`** — send a question and block until the user replies on Telegram
+- **`tg_edit`** — edit a sent message in place (progress updates)
+- **`tg_react`** — put an emoji reaction on a message
+- **`tg_typing`** — show "typing…" for a few seconds
 
-Both tools support optional `parse_mode` (`HTML`, `MarkdownV2`, `Markdown`) for rich formatting.
+`tg_send`, `tg_ask` and `tg_edit` take an optional `parse_mode` (`HTML`, `MarkdownV2`, `Markdown`); use `HTML`.
 
 ### Task Daemon — `mcp/telegram-task-daemon.js`
 Always-on bridge that long-polls Telegram for messages and spawns `claude -p <task>` per message. Lets you send tasks to Claude Code from Telegram while you're away from your desk.
 
 Features:
 - Automatic session continuation (`--continue`) across messages
+- Streams the reply live into a Telegram bubble while Claude writes it
+- Sends the final answer as one rich message (native tables, up to 32,768 chars); a longer one also gets an attached HTML page
 - Sentinel-based dedup (see rules below)
-- Smart chunking for long outputs (respects Telegram's 4096-char limit)
-- ANSI-strip for clean monospace output
 - Cross-platform: auto-detects Windows vs macOS/Linux for process spawning
 
-**Important:** `mcp/daemon-mcp.json` tells daemon-spawned Claude sessions to start `telegram-tg`. It ships with placeholder env vars (`YOUR_BOT_TOKEN_HERE`) — this is intentional. The server's `loadConfig()` detects placeholders and falls through to `.telegram-config` in the workspace root (which holds your real credentials and is gitignored). If neither source has valid credentials, the server exits with an error.
+**Important:** daemon-spawned sessions load `mcp/daemon-mcp.local.json`, which `mcp/sync-mcp-connectors.js claude` builds (the launcher runs it) from `mcp/daemon-mcp.base.json` plus your `mcp-connectors.json`. The base file starts `telegram-tg` with placeholder env vars (`YOUR_BOT_TOKEN_HERE`) — this is intentional. The server's `loadConfig()` detects placeholders and falls through to `.telegram-config` in the workspace root (which holds your real credentials and is gitignored). If neither source has valid credentials, the server exits with an error.
 
 ### Launcher — `mcp/start-task-daemon.ps1`
 PowerShell 7+ script to start the daemon in foreground or background mode. Auto-kills any previous daemon instance on restart.
@@ -55,11 +58,10 @@ Creates Windows Start Menu + Desktop shortcuts for one-click daemon launch.
 ## Shell Notes
 
 - **Shell**: PowerShell 7+ (pwsh) is the default. Use the Bash tool when a POSIX command is genuinely needed.
-- **Workspace profile**: If you have a `profile1.ps1` with custom functions, dot-source it:
+- **Your profile**: every pwsh tool call runs in a fresh non-interactive session that does NOT load `$PROFILE`. If a command needs your profile or a personal function script (this repo ships none), dot-source them first:
   ```powershell
-  . .\profile1.ps1; <your command>
+  . $PROFILE; . <path-to-your-functions.ps1>; <your command>
   ```
-  Every pwsh tool call runs in a fresh non-interactive session that does NOT load `$PROFILE`.
 
 ## Corporate TLS / Proxy
 
@@ -85,9 +87,7 @@ This requires Node.js 22.15+. PowerShell/curl already use the OS cert store and 
 
 ### RULE: When running under the task daemon (`claude -p`), write your final answer as plain Markdown — the daemon delivers it.
 
-**Detection — am I running under the daemon?**
-- Single task prompt (no conversation history) = daemon-spawned
-- You have access to MCP tool `tg_send` via `telegram-tg`
+**Detection — am I running under the daemon?** Only if your system prompt says "You are running under the Telegram task daemon" (the daemon adds that line to every session it starts). Having `tg_send`, or a conversation history, proves nothing: interactive sessions in this folder have `tg_send` too, and daemon sessions carry history.
 
 **Why:** the daemon streams your reply live into a Telegram bubble while you write it, then sends it formatted: Markdown tables become real Telegram tables, headings / bold / lists / code / links / `>` quotes are converted, long code blocks collapse, short ones get 📋 Copy buttons, a very long answer gets an attached page, and long tasks finish with 🎉. An answer inside a `tg_send` call can do none of that: it arrives all at once and tables become monospace blocks.
 
@@ -100,7 +100,9 @@ This requires Node.js 22.15+. PowerShell/curl already use the OS cert store and 
 - If you did deliver the whole answer with `tg_send` anyway, your stdout must then be only `[sent-via-tg]` (the daemon skips its own relay, so nothing is sent twice).
 
 **Formatting (Markdown):**
-- Make it vivid: emoji section headers, **bold** key facts, bullets, `code` for names/commands/IDs, and a Markdown table for anything with rows and columns.
+- Bottom line first: the answer or the decision needed goes in the first line, then one line per point. No closing summary.
+- Make it vivid: emoji section headers, **bold** key facts, bullets, `code` for names/commands/IDs.
+- Tables are welcome here (unlike in a terminal): use one for anything with rows and columns; use bullets for a plain list.
 - Tables: up to 4 columns show as a real Telegram table (good for text such as practice / why / priority); 5 or more show as an aligned monospace block (good for data such as a volume list), so keep those compact: short cells, under ~60 characters a row, numbers with units (`171 GB`, `91%`).
 - Fenced code blocks for commands and CLI output; a fence over 12 lines collapses into a tap-to-expand quote.
 - Links as `[text](https://…)`; quotes as `> …` (over 4 lines they become tap-to-expand).
@@ -126,6 +128,7 @@ Call tg_send with the whole answer as HTML → no live streaming, table drawn as
 - After `tg_ask`, carry on; the final answer is still your plain reply
 
 ### When running interactively (not daemon), respond normally in chat. These rules only apply to daemon-spawned sessions.
+Interactive sessions do not copy their replies to Telegram; use `tg_send` there only when the user asks for it (or `tg_ask` when they are away and you need an answer).
 
 ### Safety
 

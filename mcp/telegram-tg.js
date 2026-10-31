@@ -416,7 +416,7 @@ const PARSE_MODE_SCHEMA = {
 const TOOLS = [
   {
     name: 'tg_send',
-    description: 'Send a one-way notification to the operator via Telegram. Use when the agent needs human attention (e.g., approval pending, long task finished, error needs eyes). Fire-and-forget — does not wait for a reply. Pass parse_mode:"HTML" to use rich formatting. Pass file_path to attach an image/video/audio/document (rendered inline by type). Returns the sent message_id (usable with tg_edit / tg_react).',
+    description: 'Send a one-way notification to the operator via Telegram. Use when the agent needs human attention mid-task (e.g., progress on a long task, an error that needs eyes, a file to deliver). Under the Telegram task daemon, never use it for the final answer or a "done" note: the daemon delivers your reply. Fire-and-forget — does not wait for a reply. Pass parse_mode:"HTML" to use rich formatting. Pass file_path to attach an image/video/audio/document (rendered inline by type). Returns the sent message_id (usable with tg_edit / tg_react).',
     inputSchema: {
       type: 'object',
       properties: {
