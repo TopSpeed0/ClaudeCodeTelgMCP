@@ -1,7 +1,7 @@
 # Checks on every push and pull request, on Linux, macOS and Windows. No
 # secrets, no Telegram messages, no Claude: the code loads, the unit tests
 # pass, the configs parse and the MCP server lists its tools. The end-to-end
-# run with the test bot and Claude is the manual "Telegram smoke test".
+# run with the test bot and Claude is "Telegram smoke test" (pushes to main).
 name: CI
 
 on:
