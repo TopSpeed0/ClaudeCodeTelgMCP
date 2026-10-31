@@ -1,12 +1,15 @@
 # Smoke test with the test bot on every push to main (and by hand): Claude
 # answers one prompt, and the repo's own MCP server (tg_send) delivers it to
-# the test chat; then the real daemon answers one message on each OS.
+# the test chat; then the real daemon answers one message on each OS. The
+# messages name the commit. Skipped for docs-only pushes and for a commit
+# message containing [skip smoke].
 # Secrets: CLAUDE_CODE_OAUTH_TOKEN, TELEGRAM_TEST_BOT_TOKEN, TELEGRAM_TEST_CHAT_ID.
 name: Telegram smoke test
 
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
 permissions:
@@ -20,6 +23,7 @@ concurrency:
 
 jobs:
   smoke:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip smoke]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -34,7 +38,8 @@ jobs:
 
       - name: Test bot sends through tg_send
         run: |
-          node .github/smoke/telegram-smoke.js "🧪 <b>CI smoke test</b> · run #${{ github.run_number }} · <code>${GITHUB_SHA::7}</code> · ${{ runner.os }}"$'\n'"tg_send from <code>mcp/telegram-tg.js</code> works."
+          title=$(git log -1 --format=%s | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+          node .github/smoke/telegram-smoke.js "🧪 <b>CI smoke test</b> · run #${{ github.run_number }} · <code>${GITHUB_SHA::7}</code> · ${{ runner.os }}"$'\n'"📝 ${title}"$'\n'"tg_send from <code>mcp/telegram-tg.js</code> works."
 
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
@@ -85,4 +90,4 @@ jobs:
 
       - name: Daemon answers one message
         shell: bash
-        run: node .github/smoke/daemon-e2e.js "${{ runner.os }} ${GITHUB_SHA::7}"
+        run: node .github/smoke/daemon-e2e.js "${{ runner.os }} ${GITHUB_SHA::7} ($(git log -1 --format=%s))"
