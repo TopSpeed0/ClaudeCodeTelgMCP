@@ -24,7 +24,8 @@ jobs:
           node-version: '22'
 
       - name: Test bot sends through tg_send
-        run: node .github/smoke/telegram-smoke.js "🧪 <b>CI smoke test</b> · run #${{ github.run_number }} · ${{ runner.os }}"$'\n'"tg_send from <code>mcp/telegram-tg.js</code> works."
+        run: |
+          node .github/smoke/telegram-smoke.js "🧪 <b>CI smoke test</b> · run #${{ github.run_number }} · ${{ runner.os }}"$'\n'"tg_send from <code>mcp/telegram-tg.js</code> works."
 
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
