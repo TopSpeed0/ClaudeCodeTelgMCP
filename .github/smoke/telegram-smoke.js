@@ -3,6 +3,8 @@
 // stdio, checks tools/list, and sends one message to the test chat through
 // tg_send. Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (the test bot).
 // Usage: node .github/smoke/telegram-smoke.js "<html message>"
+//        node .github/smoke/telegram-smoke.js --list-only   (no message sent;
+//        checks every tool is listed, so dummy credentials are enough)
 
 const { spawn } = require('child_process');
 const path = require('path');
@@ -35,6 +37,11 @@ function request(method, params) {
   server.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
   const tools = (await request('tools/list', {})).result.tools.map(t => t.name);
   console.log(`tools: ${tools.join(', ')}`);
+  if (text === '--list-only') {
+    const missing = ['tg_send', 'tg_ask', 'tg_edit', 'tg_react', 'tg_typing'].filter(t => !tools.includes(t));
+    if (missing.length) throw new Error(`missing from tools/list: ${missing.join(', ')}`);
+    return;
+  }
   if (!tools.includes('tg_send')) throw new Error('tg_send missing from tools/list');
   const sent = await request('tools/call', { name: 'tg_send', arguments: { text, parse_mode: 'HTML' } });
   const result = sent.result || {};

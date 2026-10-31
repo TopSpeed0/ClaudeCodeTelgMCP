@@ -1,0 +1,60 @@
+# Checks on every push and pull request, on Linux, macOS and Windows. No
+# secrets, no Telegram messages, no Claude: the code loads, the unit tests
+# pass, the configs parse and the MCP server lists its tools. The end-to-end
+# run with the test bot and Claude is the manual "Telegram smoke test".
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Every JavaScript file loads
+        run: for f in mcp/*.js .github/smoke/*.js test/*.js; do node --check "$f" || exit 1; done
+
+      - name: Unit tests
+        run: node --test test/*.test.js
+
+      - name: Config files are valid JSON
+        run: node -e 'for (const f of process.argv.slice(1)) JSON.parse(require("fs").readFileSync(f, "utf8"))' $(git ls-files '*.json')
+
+      - name: PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem mcp/*.ps1) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $bad++ }
+          }
+          exit $bad
+
+      - name: Speech-to-text script compiles
+        if: runner.os == 'Linux'
+        run: python3 -m py_compile mcp/stt-faster-whisper.py
+
+      - name: MCP server lists its tools
+        env:
+          TELEGRAM_BOT_TOKEN: '123456:ci-dummy-token'
+          TELEGRAM_CHAT_ID: '1'
+        run: node .github/smoke/telegram-smoke.js --list-only
