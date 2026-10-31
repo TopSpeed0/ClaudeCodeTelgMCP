@@ -30,7 +30,7 @@ const { maskSecrets } = require('./secret-mask');
 const { noteMessage, sessionOfMessage } = require('./message-sessions');
 const handshake = require('./telegram-handshake');
 const { createTelegramClient } = require('./telegram-client');
-const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
+const { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, htmlPage, extractTables, richTables, preBlock, richMarkdown, RICH_LIMIT } = require('./telegram-ui');
 const { collectMcpServers, discoverMcpServers, callMcpTool, mcpMenuDescription } = require('./mcp-discovery');
 
 const WORKDIR = path.resolve(__dirname, '..');
@@ -264,8 +264,8 @@ function markdownToTelegramHTML(text) {
   // Stash fenced code blocks first so their contents are immune to subsequent
   // bold/italic/header rewrites. We replace them back at the very end.
   const codeBlocks = [];
-  let html = text.replace(/```[\w-]*\n?([\s\S]*?)```/g, (_m, body) => {
-    codeBlocks.push(body.replace(/\n+$/, ''));
+  let html = text.replace(/```([\w+#-]*)\n?([\s\S]*?)```/g, (_m, language, body) => {
+    codeBlocks.push({ language, body: body.replace(/\n+$/, '') });
     return `\u0000CB${codeBlocks.length - 1}\u0000`;
   });
 
@@ -326,13 +326,8 @@ function markdownToTelegramHTML(text) {
     return `<code>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</code>`;
   });
 
-  // Restore fenced code blocks as <pre>...</pre>; long ones (over 12 lines)
-  // collapse into a tap-to-expand quote so the answer stays readable.
-  html = html.replace(/\u0000CB(\d+)\u0000/g, (_m, i) => {
-    const body = codeBlocks[Number(i)];
-    const pre = `<pre>${body.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`;
-    return body.split('\n').length > 12 ? `<blockquote expandable>${pre}</blockquote>` : pre;
-  });
+  // Restore fenced code blocks (language label, long ones collapsed): preBlock.
+  html = html.replace(/\u0000CB(\d+)\u0000/g, (_m, i) => preBlock(codeBlocks[Number(i)].body, codeBlocks[Number(i)].language));
 
   html = html.replace(/\u0000TB(\d+)\u0000/g, (_m, i) => tables.tables[Number(i)]);
 

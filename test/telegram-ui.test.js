@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { extractTables, richTables, richMarkdown } = require('../mcp/telegram-ui');
+const { extractTables, richTables, richMarkdown, preBlock } = require('../mcp/telegram-ui');
 
 test('rich Markdown keeps line breaks, but not inside tables or code', () => {
   const md = 'Line one\nLine two\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n```\ncode a\ncode b\n```\nend';
@@ -51,4 +51,12 @@ test('a data table up to 60 wide stays monospace, emoji counted as two cells', (
     + `${'─'.repeat(32)}\n`
     + 'PRD_applog  prod  91% 🔴  online\n'
     + 'PRD_db      prod  62%     online</pre>');
+});
+
+test('a code block keeps its fence language as a Telegram label', () => {
+  assert.equal(preBlock('Get-Item <x> & y', 'powershell'), '<pre><code class="language-powershell">Get-Item &lt;x&gt; &amp; y</code></pre>');
+  assert.equal(preBlock('plain', ''), '<pre>plain</pre>');
+  assert.equal(preBlock('odd', 'a"b'), '<pre>odd</pre>');
+  const long = Array.from({ length: 13 }, (_, i) => `line ${i}`).join('\n');
+  assert.equal(preBlock(long, 'bash'), `<blockquote expandable><pre><code class="language-bash">${long}</code></pre></blockquote>`);
 });

@@ -9,13 +9,13 @@
 
 A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-code) with a built-in Telegram bot integration. Send tasks, receive notifications, and get remote approvals — all from your phone.
 
-> **Platform:** built and tested on **Windows**. macOS and Linux are not tested yet — some groundwork exists in the code, but the setup wizard, launcher, autostart and shortcuts are Windows-only.
+> **Platform:** built and tested on **Windows**. On macOS and Linux the bridge itself runs (CI proves it on every push), but installing and running it day to day is Windows-only for now — see [Platform support](#platform-support).
 
 ## What's Included
 
 | File | Purpose |
 |------|---------|
-| `mcp/telegram-tg.js` | Zero-dependency MCP server — gives Claude `tg_send` and `tg_ask` tools |
+| `mcp/telegram-tg.js` | Zero-dependency MCP server — gives Claude `tg_send`, `tg_ask`, `tg_edit`, `tg_react` and `tg_typing` |
 | `mcp/telegram-task-daemon.js` | Always-on bridge: Telegram messages become `claude -p` tasks |
 | `mcp/start-task-daemon.ps1` | Launcher with auto-restart (foreground or background) |
 | `mcp/install-shortcuts.ps1` | Windows Start Menu + Desktop shortcut creator |
@@ -177,14 +177,33 @@ The shared catalog includes the currently known Copilot-hosted Opus, Sonnet, and
 Direct Telegram messages and `.claude-queue.json` tasks now both perform daily rollover, use archive recovery, and append successful turns to the same archive. That prevents the queue worker from becoming a context-less second agent.
 
 ### Anti-Double-Send Pattern
-When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-via-tg]` to stdout. The daemon detects this sentinel and skips its own relay — so the user sees the message exactly once.
+Claude writes its final answer as plain Markdown and the daemon delivers it (streamed live, tables as native tables). If Claude sends the whole answer with `tg_send` instead, it prints `[sent-via-tg]` to stdout; the daemon detects this sentinel and skips its own relay — so the user sees the message exactly once.
 
 ## Customization
 
 - **Add your own tools**: Edit `CLAUDE.md` with domain-specific instructions
 - **Add a workspace profile**: Create `profile1.ps1` with custom PowerShell functions, reference it in `CLAUDE.md`
 - **Corporate proxy/TLS**: Add `--use-system-ca` to Node args in `.mcp.json` (requires Node 22.15+)
-- **Other platforms**: Tested on Windows only. The daemon has macOS/Linux code paths (process spawning, paths) but they are untested
+- **Other platforms**: see [Platform support](#platform-support)
+
+## Platform support
+
+**Windows** is the supported platform: everything below is built and tested there.
+
+**macOS and Linux — the core works, the installation does not yet.** On every push to `main`, GitHub Actions runs the real task daemon on Ubuntu, macOS and Windows: it starts, takes one Telegram message, runs Claude, streams the answer live and sends it as one rich message with both table styles. So `node mcp/telegram-task-daemon.js`, started by hand in a configured folder, works there. What CI skips, and is still missing or untested on macOS / Linux:
+
+| Piece | Windows | macOS / Linux |
+|---|---|---|
+| Task daemon (messages, Claude, streaming, tables) | ✅ | ✅ tested in CI |
+| MCP server (`tg_send`, `tg_ask`, …) | ✅ | ✅ tested in CI |
+| Setup wizard (`mcp/setup.ps1`) | ✅ | ❌ untested; its autostart step uses Windows Scheduled Tasks |
+| Launcher (`mcp/start-task-daemon.ps1`) | ✅ | ❌ untested (CI starts `node` directly) |
+| Autostart at sign-in | ✅ Scheduled Task | ❌ missing (would need launchd / systemd) |
+| ⏹ `/stop` | ✅ ends Claude and everything it started | ⚠️ ends Claude only; a command it started (e.g. an SSH session) can keep running |
+| Voice notes (Python, faster-whisper, ffmpeg) | ✅ | ❌ untested |
+| Start Menu / Desktop shortcuts | ✅ | ➖ Windows-only by nature |
+
+Until those are done and tried on a real Mac and Linux machine, the badge above stays Windows.
 
 ## Requirements
 

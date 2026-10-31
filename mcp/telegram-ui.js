@@ -131,6 +131,16 @@ function richTables(markdown, maxColumns) {
   });
 }
 
+// A fenced code block in Telegram HTML. With a fence language (```powershell)
+// Telegram shows it as a label on the block; over 12 lines it collapses into
+// a tap-to-expand quote so the answer stays readable.
+function preBlock(body, language) {
+  const code = escapeHtml(body);
+  const lang = /^[\w+#-]{1,32}$/.test(language || '') ? language : '';
+  const pre = lang ? `<pre><code class="language-${lang}">${code}</code></pre>` : `<pre>${code}</pre>`;
+  return body.split('\n').length > 12 ? `<blockquote expandable>${pre}</blockquote>` : pre;
+}
+
 // Markdown for a rich message (sendRichMessage): there a lone newline joins
 // lines into one paragraph, so it becomes a hard break ("  \n"), except inside
 // tables and code fences, which need theirs as they are. Same rule as the
@@ -152,4 +162,4 @@ function richMarkdown(text) {
   return out + breaks(src.slice(pos));
 }
 
-module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, richTables, MONO_MAX_WIDTH, richMarkdown, RICH_LIMIT };
+module.exports = { MESSAGE_EFFECTS, copyKeyboard, codeBlocks, choiceStyle, htmlPage, extractTables, richTables, preBlock, MONO_MAX_WIDTH, richMarkdown, RICH_LIMIT };
