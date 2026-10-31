@@ -3,6 +3,9 @@
 // up like a fresh install, starts mcp/telegram-task-daemon.js with the test
 // bot, hands it one message through its inbox file (a bot cannot message
 // itself), and waits until the task has finished and the answer is sent.
+// The answer has both table styles (a narrow native table and a wide one as
+// an aligned code block); the run fails unless it streamed into the live
+// bubble and went out as one rich message from the daemon, not via tg_send.
 // Needs TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and CLAUDE_CODE_OAUTH_TOKEN.
 // Only one poller per bot is allowed, so runs on several OSes must not overlap.
 // Usage: node .github/smoke/daemon-e2e.js "<label for the test chat>"
@@ -21,7 +24,7 @@ const file = (name) => path.join(root, name);
 const READY_TIMEOUT_MS = 90 * 1000;
 const TASK_TIMEOUT_MS = 6 * 60 * 1000;
 
-let daemon = null, exited = null, ready = false, recent = '';
+let daemon = null, exited = null, ready = false, logText = '';
 
 // A fresh install: example configs, credentials, generated MCP config.
 function setUp() {
@@ -49,8 +52,8 @@ function startDaemon() {
   daemon.stderr.setEncoding('utf8');
   daemon.stderr.on('data', (chunk) => {
     process.stderr.write(chunk);
-    recent = (recent + chunk).slice(-500);
-    if (recent.includes('] ready — ')) ready = true;
+    logText += chunk;
+    if (logText.includes('] ready — ')) ready = true;
   });
   daemon.on('exit', (code, signal) => { exited = `exit code ${code}${signal ? `, ${signal}` : ''}`; });
 }
@@ -86,8 +89,9 @@ function lastJob() {
   startDaemon();
   await waitFor('the daemon to be ready', READY_TIMEOUT_MS, () => ready);
   // One message, shaped like a Telegram update from the owner.
-  const text = `🧪 CI daemon test on ${label}. Reply with one short sentence that names this operating system `
-    + `(${label}) and confirms the task daemon delivered this message. Do not use any tool other than tg_send.`;
+  const text = `🧪 CI daemon test on ${label}. Use no tools, just reply, in one answer: a heading "🧪 CI on ${label}", `
+    + 'then a 3-column table of 3 storage tips (tip, why, priority), then a 5-column table of 4 made-up volumes '
+    + '(volume, SVM, size, used %, state; mark 90% or more with 🔴).';
   fs.writeFileSync(file('.telegram-daemon-inbox.json'), JSON.stringify([{
     message_id: Math.floor(Date.now() / 1000) % 1e9,
     from: { id: Number(chatId), is_bot: false, first_name: 'CI' },
@@ -103,6 +107,12 @@ function lastJob() {
   });
   console.log(`--- job ${job.status} after ${((Date.now() - t0) / 1000).toFixed(0)}s ---`);
   if (job.status !== 'success') throw new Error(`the task ended as ${job.status}`);
+  // The bubble logs its summary as it closes, just after the job is recorded.
+  const draft = await waitFor('the live bubble summary', 30 * 1000, () => /draft: \d+ update\(s\), (\d+) chars streamed/.exec(logText));
+  if (/relay suppressed: agent used tg_send/.test(logText)) throw new Error('the answer went through tg_send instead of the daemon');
+  if (/rich message refused/.test(logText)) throw new Error('Telegram refused the rich message (tables fell back to HTML)');
+  if (Number(draft[1]) === 0) throw new Error('nothing was streamed into the live bubble');
+  console.log(`--- streamed ${draft[1]} chars live, sent as one rich message ---`);
 })()
   .then(() => { stopDaemon(); process.exit(0); })
   .catch((e) => { console.error(`FAILED: ${e.message}`); stopDaemon(); process.exit(1); });
