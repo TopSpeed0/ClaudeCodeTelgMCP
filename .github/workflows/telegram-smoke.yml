@@ -38,3 +38,42 @@ jobs:
           echo "$answer"
           answer=$(printf '%s' "$answer" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
           node .github/smoke/telegram-smoke.js "🤖 <b>Claude in CI</b> · $(claude --version)"$'\n'"$answer"
+
+  # The real task daemon on each OS: fresh-install setup, one message through
+  # its inbox file, Claude answers in the test chat. One OS at a time, since
+  # Telegram allows only one poller per bot.
+  daemon:
+    needs: smoke
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TEST_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_TEST_CHAT_ID }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      # The daemon spawns claude.exe directly on Windows (claude.cmd would go through cmd.exe).
+      - name: Point the daemon at claude.exe
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          exe="$(npm root -g)/@anthropic-ai/claude-code/bin/claude.exe"
+          ls -la "$exe"
+          echo "CLAUDE_EXECUTABLE=$(cygpath -w "$exe")" >> "$GITHUB_ENV"
+
+      - name: Daemon answers one message
+        shell: bash
+        run: node .github/smoke/daemon-e2e.js "${{ runner.os }}"
