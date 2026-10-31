@@ -5,9 +5,11 @@
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
 [![Claude Code](https://img.shields.io/badge/Claude%20Code-MCP%20Server-7C3AED.svg?logo=anthropic&logoColor=white)](https://claude.com/claude-code)
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4.svg)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#)
 
 A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-code) with a built-in Telegram bot integration. Send tasks, receive notifications, and get remote approvals — all from your phone.
+
+> **Platform:** built and tested on **Windows**. macOS and Linux are not tested yet — some groundwork exists in the code, but the setup wizard, launcher, autostart and shortcuts are Windows-only.
 
 ## What's Included
 
@@ -29,7 +31,7 @@ A ready-to-clone workspace template for [Claude Code](https://claude.com/claude-
 
 Install all three in any order — one line each:
 
-| Tool | Windows | macOS / Linux |
+| Tool | Windows | macOS / Linux (untested) |
 |------|---------|---------------|
 | **Node.js 22+** | `winget install OpenJS.NodeJS.LTS` | `curl -fsSL https://fnm.vercel.app/install \| bash && fnm install --lts` |
 | **PowerShell 7+** | `winget install Microsoft.PowerShell` | `brew install powershell` / [install docs](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-linux) |
@@ -67,14 +69,14 @@ Run it again any time to repair a setup: what exists is kept and only missing pi
 
 ### One-Prompt Install
 
-Manual alternative (and the macOS / Linux path). Copy-paste this single block — it clones the repo, creates your config, and opens Claude Code:
+Manual alternative. Copy-paste this single block — it clones the repo, creates your config, and opens Claude Code:
 
 **Windows (PowerShell):**
 ```powershell
 git clone https://github.com/TopSpeed0/claude-telegram-bridge.git; cd claude-telegram-bridge; Copy-Item .mcp.json.example .mcp.json; '{}' | Out-File -Encoding utf8 .claude-queue.json; Write-Host "`nEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude" -ForegroundColor Cyan
 ```
 
-**macOS / Linux (bash):**
+**macOS / Linux (bash, untested):**
 ```bash
 git clone https://github.com/TopSpeed0/claude-telegram-bridge.git && cd claude-telegram-bridge && cp .mcp.json.example .mcp.json && echo '{}' > .claude-queue.json && echo -e "\n\033[36mEdit .mcp.json — paste your TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then run: claude\033[0m"
 ```
@@ -182,7 +184,7 @@ When Claude uses `tg_send` to deliver a rich-formatted answer, it prints `[sent-
 - **Add your own tools**: Edit `CLAUDE.md` with domain-specific instructions
 - **Add a workspace profile**: Create `profile1.ps1` with custom PowerShell functions, reference it in `CLAUDE.md`
 - **Corporate proxy/TLS**: Add `--use-system-ca` to Node args in `.mcp.json` (requires Node 22+)
-- **Cross-platform**: The daemon auto-detects Windows vs macOS/Linux for process spawning
+- **Other platforms**: Tested on Windows only. The daemon has macOS/Linux code paths (process spawning, paths) but they are untested
 
 ## Requirements
 
